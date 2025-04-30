@@ -19,57 +19,9 @@ u-boot-mainline branch.
 
 load("@bazel_tools//tools/build_defs/repo:utils.bzl", "maybe")
 load("@gbl//toolchain:gbl_workspace_util.bzl", "android_rust_prebuilts", "gbl_config", "gbl_llvm_prebuilts")
+load("@gbl//toolchain:rust_crate_build_file.bzl", "rust_crate_build_file")
 
 _CLANG_VERSION = "r547379"
-
-def rust_crate_build_file(
-        name,
-        rule = "rust_library",
-        crate_name = "",
-        deps = [],
-        proc_macro_deps = [],
-        features = [],
-        edition = "2021",
-        rustc_flags = []):
-    """Generate BUILD file content for a rust crate
-
-    This helper is suitable for crates that have straightforward build rules. Specifically, the
-    crate contains a single Rust target that includes all source files under the repo.
-    There is not any need of preprocessing, patching or source generation.
-
-    Args:
-        name (String): name of the rust_library target.
-        rule (String): Bazel Rust rule to build, defaults to `rust_library`.
-        crate_name (String): name of the rust_library crate, same as name by default.
-        deps (List of strings): The `deps` field.
-        proc_macro_deps (List of strings): The `proc_macro_deps` field.
-        features (List of strings): The `features` field.
-        edition (String): Rust edition.
-        rustc_flags (List of strings): The `rustc_flags` field.
-
-    Returns:
-        A string for the BUILD file content.
-    """
-    crate_name = name if len(crate_name) == 0 else crate_name
-    deps = "[{}]".format(",".join(["\"{}\"".format(ele) for ele in deps]))
-    proc_macro_deps = "[{}]".format(",".join(["\"{}\"".format(ele) for ele in proc_macro_deps]))
-    features = "[{}]".format(",".join(["\"{}\"".format(ele) for ele in features]))
-    rustc_flags = "[{}]".format(",".join(["\"{}\"".format(ele) for ele in rustc_flags]))
-    return """
-load("@rules_rust//rust:defs.bzl", \"{rule}\")
-
-{rule}(
-    name = \"{}\",
-    crate_name = \"{}\",
-    srcs = glob(["**/*.rs"]),
-    crate_features = {},
-    edition = \"{edition}\",
-    rustc_flags = {},
-    visibility = ["//visibility:public"],
-    deps = {},
-    proc_macro_deps = {}
-)
-""".format(name, crate_name, features, rustc_flags, deps, proc_macro_deps, edition = edition, rule = rule)
 
 def define_gbl_workspace(name = None):
     """Set up worksapce dependencies for GBL
@@ -84,6 +36,11 @@ def define_gbl_workspace(name = None):
         repo_rule = native.local_repository,
         name = "rules_rust",
         path = "external/bazelbuild-rules_rust",
+    )
+    maybe(
+        repo_rule = native.local_repository,
+        name = "rules_rust_bindgen",
+        path = "external/bazelbuild-rules_rust/extensions/bindgen",
     )
 
     maybe(
@@ -118,11 +75,13 @@ def define_gbl_workspace(name = None):
     native.new_local_repository(
         name = "linux_x86_64_sysroot",
         path = "prebuilts/gcc/linux-x86/host/x86_64-linux-glibc2.17-4.8",
-        build_file_content = """exports_files(glob(["**/*"]))
+        build_file_content = """
+load("@rules_cc//cc:defs.bzl", "cc_library")
+exports_files(glob(["**/*"]))
 cc_library(
     name = "linux_x86_64_sysroot_include",
     hdrs = glob(["sysroot/usr/include/**/*.h"]),
-    includes = [ "sysroot/usr/include" ],
+    includes = [ "sysroot/usr/include", "sysroot/usr/include/x86_64-linux-gnu" ],
     visibility = ["//visibility:public"],
 )
 """,
@@ -144,6 +103,7 @@ cc_library(
         name = "elfutils",
         path = "external/elfutils",
         build_file_content = """
+load("@rules_cc//cc:defs.bzl", "cc_library")
 cc_library(
     name = "elf_type_header",
     hdrs = ["libelf/elf.h"],
@@ -155,7 +115,16 @@ cc_library(
     native.new_local_repository(
         name = "mkbootimg",
         path = "tools/mkbootimg",
-        build_file_content = """exports_files(glob(["**/*"]))""",
+        build_file_content = """
+load("@rules_cc//cc:defs.bzl", "cc_library")
+exports_files(glob(["**/*"]))
+cc_library(
+    name = "bootimg_header",
+    hdrs = ["include/bootimg/bootimg.h"],
+    includes = ["include"],
+    visibility = ["//visibility:public"],
+)
+""",
     )
 
     native.new_local_repository(
