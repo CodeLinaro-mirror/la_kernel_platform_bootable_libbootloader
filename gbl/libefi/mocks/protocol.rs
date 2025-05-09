@@ -28,6 +28,9 @@ use efi_types::{
 use liberror::Result;
 use mockall::mock;
 
+/// Mock `Protocol` type.
+pub type Protocol<'a, T> = T;
+
 /// Mock device_path module.
 pub mod device_path {
     use super::*;
@@ -346,4 +349,23 @@ pub mod gbl_efi_ab_slot {
 
     /// Map to the libefi name so code under test can just use one name.
     pub type GblSlotProtocol = MockGblSlotProtocol;
+}
+
+/// Mock avf protocol.
+pub mod gbl_efi_avf {
+    use super::*;
+
+    mock! {
+        /// Mock [efi::AvfProtocol].
+        pub GblAvfProtocol {
+            /// Wraps `GBL_EFI_AVF_PROTOCOL.read_vendor_dice_handover()`.
+            pub fn read_vendor_dice_handover(&self, handover_buffer: &mut [u8]) -> Result<usize>;
+
+            /// Wraps `GBL_EFI_AVF_PROTOCOL.read_secretkeeper_public_key()`.
+            pub fn read_secretkeeper_public_key(&self, key_buffer: &mut [u8]) -> Result<usize>;
+        }
+    }
+
+    /// Map to the libefi name so code under test can just use one name.
+    pub type GblAvfProtocol = MockGblAvfProtocol;
 }
