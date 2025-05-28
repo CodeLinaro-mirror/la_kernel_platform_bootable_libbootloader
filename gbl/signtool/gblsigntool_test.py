@@ -18,13 +18,12 @@
 from pathlib import Path
 import shutil
 import subprocess
-import sys
 import tempfile
 import unittest
 
 
 def GetResource(*args):
-  return Path(sys.argv[0]).absolute().parent.joinpath(*args)
+  return Path(__file__).absolute().parent.joinpath(*args)
 
 
 def Gblsigntool(*args):
@@ -145,4 +144,4 @@ class GblSigntoolTest(unittest.TestCase):
 
 
 if __name__ == '__main__':
-  unittest.main(verbosity=2)
+  unittest.main()

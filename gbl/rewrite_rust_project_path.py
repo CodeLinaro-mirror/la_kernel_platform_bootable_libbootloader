@@ -11,14 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Script for fixing up rust-project.json"""
 
-import argparse
 import json
-import logging
 import os
-import shutil
+import logging
 import tempfile
+import shutil
 
 # To generate rust-project.json from bazel, run
 # ./tools/bazel run @rules_rust//tools/rust_analyzer:gen_rust_project --norepository_disable_download -- --bazel ./tools/bazel @gbl//efi/...
@@ -31,45 +29,10 @@ import tempfile
 # source path for you by checking if any of the parent path is a symlink,
 # and resolve all symlinks to final destination.
 
-ARCH_X86_64 = "x86_64"
-ARCH_AARCH64 = "aarch64"
-# CARGO_CFG_TARGET_ARCH does not recognize riscv64 yet. But we expect it to
-# some time in the future.
-ARCH_RISCV64 = "riscv64"
 
-# Contains arch specific override of rust-project.json
-ARCH_TARGET = {
-    ARCH_X86_64: "x86_64-unknown-uefi",
-    ARCH_AARCH64: "aarch64-unknown-uefi",
-    ARCH_RISCV64: "riscv64-unknown-linux",  # RISCV uses ELF->UEI conversion.
-}
-
-
-def _parse_args() -> argparse.Namespace:
-  parser = argparse.ArgumentParser(
-      description=__doc__,
-      formatter_class=argparse.RawDescriptionHelpFormatter,
-  )
-
-  parser.add_argument(
-      "file",
-      nargs="?",
-      help="Path to rust-project.json",
-      default="rust-project.json",
-  )
-  parser.add_argument(
-      "--arch",
-      choices=[ARCH_X86_64, ARCH_AARCH64, ARCH_RISCV64],
-      default=ARCH_AARCH64,
-      help="Target architecture",
-  )
-
-  return parser.parse_args()
-
-
-def traverse(obj: dict, arch: str):
+def traverse(obj: dict):
   if isinstance(obj, dict):
-    for key, val in obj.items():
+    for (key, val) in obj.items():
       if key == "root_module" or key == "CARGO_MANIFEST_DIR":
         obj[key] = os.path.realpath(val)
         continue
@@ -79,28 +42,23 @@ def traverse(obj: dict, arch: str):
       elif key == "cfg" and isinstance(val, list):
         obj[key] = [o for o in val if o != "test"]
         continue
-      elif key == "CARGO_CFG_TARGET_OS":
-        obj[key] = "uefi"
-      elif key == "CARGO_CFG_TARGET_ARCH":
-        obj[key] = arch
-      elif key == "target":
-        obj[key] = ARCH_TARGET[arch]
-      traverse(val, arch)
+      traverse(val)
   elif isinstance(obj, list):
     for item in obj:
-      traverse(item, arch)
+      traverse(item)
 
 
-def main():
-  args = _parse_args()
-
+def main(argv):
   logging.basicConfig(level=logging.INFO)
-  rust_project_json_path = args.file
+  rust_project_json_path = "rust-project.json"
+  if len(argv) == 2:
+    rust_project_json_path = argv[1]
+  rust_project_json_path = os.path.realpath(rust_project_json_path)
   project_root_path = os.path.dirname(rust_project_json_path)
   logging.info("Using %s as project root path", project_root_path)
   with open(rust_project_json_path, "r") as fp:
     data = json.load(fp)
-    traverse(data, args.arch)
+    traverse(data)
 
   with tempfile.NamedTemporaryFile("w+", delete=False) as fp:
     json.dump(data, fp.file, indent=True)
@@ -109,4 +67,6 @@ def main():
 
 
 if __name__ == "__main__":
-  main()
+  import sys
+
+  main(sys.argv)

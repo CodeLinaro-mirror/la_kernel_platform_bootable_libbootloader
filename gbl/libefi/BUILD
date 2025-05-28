@@ -58,7 +58,6 @@ rust_library(
         "@gbl//libefi",
         "@gbl//libefi_types",
         "@gbl//liberror",
-        "@gbl//libgbl",
         "@mockall",
     ],
 )

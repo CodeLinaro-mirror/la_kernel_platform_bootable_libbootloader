@@ -19,7 +19,6 @@
 
 #![feature(negative_impls)]
 
-pub mod profiling;
 pub mod protocol;
 pub mod utils;
 
@@ -34,7 +33,6 @@ use protocol::{
     gbl_efi_fastboot::GblFastbootProtocol,
     gbl_efi_os_configuration::GblOsConfigurationProtocol,
     simple_text_output::{passthrough_con_out, MockSimpleTextOutputProtocol},
-    timestamp::TimestampProtocol,
 };
 use std::cell::RefCell;
 
@@ -270,11 +268,6 @@ fn passthrough_boot_services() -> MockBootServices {
     services.expect_find_first_and_open::<GblAvfProtocol>().returning(|| {
         MOCK_EFI.with_borrow_mut(|efi| {
             efi.as_mut().unwrap().boot_services.find_first_and_open::<GblAvfProtocol>()
-        })
-    });
-    services.expect_find_first_and_open::<TimestampProtocol>().returning(|| {
-        MOCK_EFI.with_borrow_mut(|efi| {
-            efi.as_mut().unwrap().boot_services.find_first_and_open::<TimestampProtocol>()
         })
     });
 
