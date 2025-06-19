@@ -46,9 +46,9 @@ pub const AVB_DIGEST_KEY: &str = "androidboot.vbmeta.digest";
 const AVB_CERT_NUM_KEY_VERSIONS: usize = 2;
 
 /// Implements avb ops callbacks for [GblOps].
-pub struct GblAvbOps<'a, 'b, T> {
+pub struct GblAvbOps<'a, T> {
     /// The underlying [GblOps].
-    pub gbl_ops: &'b mut T,
+    pub gbl_ops: &'a mut T,
     slot: Option<SlotIndex>,
     /// Slotless partitions pre-loaded by the implementation. Provided to avoid redundant IO.
     preloaded_partitions: &'a [(&'a str, &'a [u8])],
@@ -67,10 +67,10 @@ pub struct GblAvbOps<'a, 'b, T> {
     key_validation_status: Option<KeyValidationStatus>,
 }
 
-impl<'a, 'b, 'p, 'q, T: GblOps<'p, 'q>> GblAvbOps<'a, 'b, T> {
+impl<'a, 'p, 'q, T: GblOps<'p, 'q>> GblAvbOps<'a, T> {
     /// Creates a new [GblAvbOps].
     pub fn new(
-        gbl_ops: &'b mut T,
+        gbl_ops: &'a mut T,
         slot: Option<SlotIndex>,
         preloaded_partitions: &'a [(&'a str, &'a [u8])],
         use_cert: bool,
@@ -254,7 +254,7 @@ fn split_slotted(partition: &str) -> Result<(&str, SlotIndex), Error> {
 /// # Lifetimes
 /// * `'a`: preloaded data lifetime
 /// * `'b`: [GblOps] partition lifetime
-impl<'a, 'b, 'p, 'q, T: GblOps<'p, 'q>> AvbOps<'a> for GblAvbOps<'a, 'b, T> {
+impl<'a, 'b, 'c, T: GblOps<'b, 'c>> AvbOps<'a> for GblAvbOps<'a, T> {
     fn read_from_partition(
         &mut self,
         partition: &CStr,
@@ -450,7 +450,7 @@ impl<'a, 'b, 'p, 'q, T: GblOps<'p, 'q>> AvbOps<'a> for GblAvbOps<'a, 'b, T> {
 }
 
 /// [GblAvbOps] always implements [CertOps], but it's only used if `use_cert` is set.
-impl<'a, 'b, T: GblOps<'a, 'b>> CertOps for GblAvbOps<'_, '_, T> {
+impl<'a, 'b, T: GblOps<'a, 'b>> CertOps for GblAvbOps<'_, T> {
     fn read_permanent_attributes(
         &mut self,
         attributes: &mut CertPermanentAttributes,
