@@ -46,6 +46,12 @@ fn page_aligned_range(
     Ok(start.try_into()?..(start + sz.into()).round_up(page_size.into()).try_into()?)
 }
 
+/// Returns the exact payload range without including alignment padding.
+fn exact_range(start: impl Into<SafeNum>, sz: impl Into<SafeNum>) -> Result<Range<usize>, Error> {
+    let start = start.into();
+    Ok(start.try_into()?..(start + sz.into()).try_into()?)
+}
+
 /// Represents a loaded boot image of version 2 and lower.
 ///
 /// TODO(b/384964561): Investigate if the APIs are better suited for bootimg.rs. The issue
@@ -53,7 +59,8 @@ fn page_aligned_range(
 #[derive(Clone)]
 struct BootImageV2Info<'a> {
     cmdline: &'a str,
-    kernel_range: Range<usize>,
+    /// Kernel payload without the page alignment padding.
+    kernel_exact_range: Range<usize>,
     ramdisk_range: Range<usize>,
     dtb_range: Range<usize>,
 }
@@ -70,6 +77,7 @@ impl<'a> BootImageV2Info<'a> {
         let page_size: usize = v0.page_size.try_into()?;
         let cmdline = cstr_bytes_to_str(&v0.cmdline[..])?;
         let kernel_range = page_aligned_range(page_size, v0.kernel_size, page_size)?;
+        let kernel_exact_range = exact_range(page_size, v0.kernel_size)?;
         let ramdisk_range = page_aligned_range(kernel_range.end, v0.ramdisk_size, page_size)?;
         let second_range = page_aligned_range(ramdisk_range.end, v0.second_size, page_size)?;
 
@@ -89,7 +97,7 @@ impl<'a> BootImageV2Info<'a> {
             _ => 0,
         };
         let dtb_range = page_aligned_range(recovery_dtb_range.end, dtb_sz, page_size)?;
-        Ok(Self { cmdline, kernel_range, ramdisk_range, dtb_range })
+        Ok(Self { cmdline, kernel_exact_range, ramdisk_range, dtb_range })
     }
 }
 
@@ -97,6 +105,8 @@ impl<'a> BootImageV2Info<'a> {
 #[derive(Clone)]
 pub(crate) struct BootImageV3Info {
     pub kernel_range: Range<usize>,
+    /// Kernel payload without the page alignment padding.
+    kernel_exact_range: Range<usize>,
     pub ramdisk_range: Range<usize>,
 }
 
@@ -109,8 +119,9 @@ impl BootImageV3Info {
         }
         let v3 = Self::v3(buffer);
         let kernel_range = page_aligned_range(PAGE_SIZE, v3.kernel_size, PAGE_SIZE)?;
+        let kernel_exact_range = exact_range(PAGE_SIZE, v3.kernel_size)?;
         let ramdisk_range = page_aligned_range(kernel_range.end, v3.ramdisk_size, PAGE_SIZE)?;
-        Ok(Self { kernel_range, ramdisk_range })
+        Ok(Self { kernel_range, kernel_exact_range, ramdisk_range })
     }
 
     /// Gets the v3 base header.
@@ -375,7 +386,7 @@ fn load_v2_or_lower_verified<'a, 'b, 'c>(
     images.boot_cmdline = info.cmdline;
     images.dtb = get_range(boot, &info.dtb_range)?;
     images.dtb_source = Some(DtComponentSource::Boot);
-    images.kernel = get_range(boot, &info.kernel_range)?;
+    images.kernel = get_range(boot, &info.kernel_exact_range)?;
     images.ramdisks.push(get_range(boot, &info.ramdisk_range)?);
     Ok(())
 }
@@ -464,7 +475,7 @@ fn load_v3_and_v4_verified<'a, 'b>(
     images.dtb = get_range(vendor_boot, &vendor_boot_info.dtb_range)?;
     images.dtb_source = Some(DtComponentSource::VendorBoot);
     images.vendor_bootconfig = get_range(vendor_boot, &vendor_boot_info.bootconfig_range)?;
-    images.kernel = get_range(boot, &boot_info.kernel_range)?;
+    images.kernel = get_range(boot, &boot_info.kernel_exact_range)?;
     parse_vendor_ramdisks(&vendor_boot, &vendor_boot_info, is_recovery, &mut images.ramdisks)?;
 
     // Finds and loads vendor_kernel_boot partition if provided.
@@ -528,8 +539,10 @@ pub(crate) fn aligned_tail_offset(
 #[cfg(feature = "fuchsia")]
 pub fn get_kernel(boot: &[u8]) -> Result<&[u8], Error> {
     match BootImage::parse(&boot[..]).map_err(Error::from)? {
-        BootImage::V3(_) | BootImage::V4(_) => boot.get(BootImageV3Info::new(boot)?.kernel_range),
-        _ => boot.get(BootImageV2Info::new(boot)?.kernel_range),
+        BootImage::V3(_) | BootImage::V4(_) => {
+            boot.get(BootImageV3Info::new(boot)?.kernel_exact_range)
+        }
+        _ => boot.get(BootImageV2Info::new(boot)?.kernel_exact_range),
     }
     .ok_or(Error::InvalidInput)
 }
@@ -809,4 +822,58 @@ fn move_left(
     buffer.get(..sub.len()).ok_or(Error::BufferTooSmall(Some(sub.len())))?;
     buffer.copy_within(buffer.len() - sub.len().., 0);
     Ok(sub_slice_range(&range, &buffer[..sub.len()].as_ptr_range()).unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn add_header<T: zerocopy::Immutable + IntoBytes>(buffer: &mut [u8], header: T) {
+        header.write_to_prefix(buffer).unwrap();
+    }
+
+    #[test]
+    fn v0_kernel_exact_range_excludes_page_padding() {
+        let mut image = [0u8; PAGE_SIZE * 4];
+        let kernel_size = PAGE_SIZE as u32 + 13;
+        add_header(
+            &mut image,
+            boot_img_hdr_v0 {
+                magic: BOOT_MAGIC[..BOOT_MAGIC_SIZE as usize].try_into().unwrap(),
+                kernel_size,
+                ramdisk_size: 17,
+                page_size: PAGE_SIZE as u32,
+                header_version: 0,
+                ..Default::default()
+            },
+        );
+
+        let info = BootImageV2Info::new(&image).unwrap();
+        assert_eq!(info.kernel_exact_range, PAGE_SIZE..PAGE_SIZE + kernel_size as usize);
+        assert_eq!(info.ramdisk_range.start, PAGE_SIZE * 3);
+    }
+
+    #[test]
+    fn v4_kernel_exact_range_excludes_page_padding() {
+        let mut image = [0u8; PAGE_SIZE * 4];
+        let kernel_size = PAGE_SIZE as u32 + 13;
+        add_header(
+            &mut image,
+            boot_img_hdr_v4 {
+                _base: boot_img_hdr_v3 {
+                    magic: BOOT_MAGIC[..BOOT_MAGIC_SIZE as usize].try_into().unwrap(),
+                    kernel_size,
+                    ramdisk_size: 17,
+                    header_version: 4,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let info = BootImageV3Info::new(&image).unwrap();
+        assert_eq!(info.kernel_exact_range, PAGE_SIZE..PAGE_SIZE + kernel_size as usize);
+        assert_eq!(info.kernel_range, PAGE_SIZE..PAGE_SIZE * 3);
+        assert_eq!(info.ramdisk_range.start, PAGE_SIZE * 3);
+    }
 }
