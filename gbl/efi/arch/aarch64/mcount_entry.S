@@ -45,6 +45,7 @@ mcount:
  * -----------------------------------------------------
  */
 mcount_return_override:
+    bti jc
     /* We are in the context of caller's parent. Since we don't know which
     caller-saved registers it uses, just save all of them. */
     sub sp, sp, CALLER_SAVE_REG_SIZE

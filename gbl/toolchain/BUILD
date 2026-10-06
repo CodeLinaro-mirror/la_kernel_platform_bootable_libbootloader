@@ -427,10 +427,18 @@ cc_flags_uefi_common = cc_flags_common + [
     "-funwind-tables",
 ] + uefi_c_lto_flags
 
-uefi_ld_flags_common = [
-    "-z,noexecstack",
-    "-z,now",
+uefi_pe_ld_flags_common = [
+    "/NXCOMPAT",
+    "/DYNAMICBASE",
+    "/HIGHENTROPYVA",
+]
+
+elf_ld_flags_common = [
+    "-znoexecstack",
+    "-zrelro",
+    "-znow",
     "--as-needed",
+    "--fatal-warnings",
 ]
 
 builtin_includes_uefi_common = [GBL_CPP_CONFIG_INC] + builtin_includes_common + [GBL_EFI_SYSROOT]
@@ -453,7 +461,7 @@ gbl_clang_cc_toolchain(
     name = "x86_64_uefi_clang_cc_toolchain",
     builtin_includes = builtin_includes_uefi_common,
     cc_flags = x86_64_uefi_cc_flags,
-    ld_flags = uefi_ld_flags_common,
+    ld_flags = uefi_pe_ld_flags_common,
     target_cpu = "x86_64",
     target_system_triple = "x86_64-unknown-windows-msvc",
 )
@@ -468,7 +476,9 @@ toolchain(
 
 # x86_64 UEFI DEBUG targets
 
-x86_64_uefi_debug_cc_flags = x86_64_uefi_cc_flags
+x86_64_uefi_debug_cc_flags = x86_64_uefi_cc_flags + [
+    "-O0",
+]
 
 x86_64_uefi_debug_cc_flags.remove("-O3")
 
@@ -476,7 +486,7 @@ gbl_clang_cc_toolchain(
     name = "x86_64_uefi_debug_clang_cc_toolchain",
     builtin_includes = builtin_includes_uefi_common,
     cc_flags = x86_64_uefi_debug_cc_flags,
-    ld_flags = uefi_ld_flags_common,
+    ld_flags = uefi_pe_ld_flags_common,
     target_cpu = "x86_64",
     target_system_triple = "x86_64-unknown-windows",
 )
@@ -490,17 +500,19 @@ toolchain(
 )
 
 # aarch64 UEFI targets
+aarch64_branch_protection = "-mbranch-protection=pac-ret+leaf+bti"
+
 gbl_clang_cc_toolchain(
     name = "aarch64_uefi_clang_cc_toolchain",
     builtin_includes = builtin_includes_uefi_common,
     cc_flags = cc_flags_uefi_common + [
-        "-mbranch-protection=standard",
+        aarch64_branch_protection,
         "-march=armv8-a",
     ] + select({
         ":tracing_enabled": ["-pg"],  # mcount instrumentation
         "//conditions:default": [],
     }),
-    ld_flags = uefi_ld_flags_common + select({
+    ld_flags = uefi_pe_ld_flags_common + select({
         # Switch to a dedicate main entry that sets up tracing.
         ":tracing_enabled": ["/entry:efi_main_tracing"],
         "//conditions:default": [],
@@ -520,7 +532,7 @@ toolchain(
 # aarch64 UEFI DEBUG targets
 
 aarch64_uefi_debug_cc_flags = cc_flags_uefi_common + [
-    "-mbranch-protection=standard",
+    aarch64_branch_protection,
     "-O0",
 ]
 
@@ -530,7 +542,7 @@ gbl_clang_cc_toolchain(
     name = "aarch64_uefi_debug_clang_cc_toolchain",
     builtin_includes = builtin_includes_uefi_common,
     cc_flags = aarch64_uefi_debug_cc_flags,
-    ld_flags = uefi_ld_flags_common,
+    ld_flags = uefi_pe_ld_flags_common,
     target_cpu = "aarch64",
     target_system_triple = "aarch64-unknown-windows",
 )
@@ -560,7 +572,7 @@ gbl_clang_cc_toolchain(
         # The default setting 'all' causes problems on RISC-V
         "-fstack-protector-strong",
     ],
-    ld_flags = uefi_ld_flags_common,
+    ld_flags = elf_ld_flags_common,
     target_cpu = "riscv64",
     target_system_triple = "riscv64-unknown-linux",
 )
@@ -579,7 +591,9 @@ gbl_clang_cc_toolchain(
     cc_flags = cc_flags_uefi_common + [
         "-fpie",
         "-march=armv8-a",
+        aarch64_branch_protection,
     ],
+    ld_flags = elf_ld_flags_common,
     target_cpu = "aarch64",
     target_system_triple = "aarch64-none-elf",
 )
@@ -960,8 +974,11 @@ rust_toolchain(
     binary_ext = "",
     default_edition = "2021",
     dylib_ext = ".so",
-    exec_triple = "aarch64-unknown-linux-gnu",
-    extra_rustc_flags = rustc_common_flags + msvc_rustc_debug_common,
+    exec_triple = "x86_64-unknown-linux-musl",
+    extra_rustc_flags = [
+        "-Z",
+        "branch-protection=bti,pac-ret,leaf",
+    ] + rustc_common_flags + msvc_rustc_debug_common,
     global_allocator_library = None,
     rust_doc = "@rust_prebuilts//:bin/rustdoc",
     # Need to use our own built sysroot because we are using a custom spec below.
@@ -1132,7 +1149,10 @@ rust_toolchain(
     default_edition = "2021",
     dylib_ext = ".so",
     exec_triple = "x86_64-unknown-linux-musl",
-    extra_rustc_flags = rustc_common_flags + rustc_opt_flags + [
+    extra_rustc_flags = [
+        "-Z",
+        "branch-protection=bti,pac-ret,leaf",
+    ] + rustc_common_flags + rustc_opt_flags + [
         "-C",
         "relocation-model=pic",
         "-C",
