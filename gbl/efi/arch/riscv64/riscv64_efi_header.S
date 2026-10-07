@@ -175,6 +175,7 @@ end_of_header:
 // Traditionally, PE/COFF header occupies the entire first page. We keep this pattern.
 .align 9
 
+.global _start
 _start:
   // Behave like a function call.
   addi sp, sp, -8*3
