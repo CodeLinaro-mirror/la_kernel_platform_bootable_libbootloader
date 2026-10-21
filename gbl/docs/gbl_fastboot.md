@@ -159,7 +159,9 @@ Examples:
 
 - `fastboot flash gpt` -- If there is only one storage or a default storage ID
   is set via `fastboot oem gbl-set-default-block <default ID>`, updates the GPT
-  of that storage.
+  of that storage. Otherwise, if exactly one storage uses the GPT partition
+  scheme, updates the GPT of that storage. Raw storage devices (see
+  [partitions](./partitions.md)) are not considered.
 - `fastboot flash gpt//resize` -- Same as `fastboot flash gpt` but also performs
   resizing.
 - `fastboot flash gpt/0` -- Update GPT to storage device 0.
@@ -178,9 +180,8 @@ unchanged.
 
 Examples:
 
-- `fastboot erase gpt` -- If there is only one storage or a default storage ID
-  is set via `fastboot oem gbl-set-default-block <default ID>`, erase the GPT of
-  that storage.
+- `fastboot erase gpt` -- Resolves the storage device the same way as
+  `fastboot flash gpt` and erases its GPT.
 - `fastboot erase gpt/0` -- Erase GPT to storage device 0.
 
 If a storage device's GPT is modified outside of `fastboot flash gpt` /
