@@ -290,7 +290,7 @@ where
     /// # Returns
     ///
     /// * Returns `Ok(Some(sync_res))` if partition type is GPT and disk access is successful, where
-    ///  `sync_res` contains the GPT verification and restoration result.
+    ///   `sync_res` contains the GPT verification and restoration result.
     /// * Returns `Ok(None)` if partition type is not GPT.
     /// * Returns `Err` in other cases.
     pub async fn sync_gpt(&self) -> Result<Option<GptSyncResult>, Error> {
@@ -311,7 +311,7 @@ where
     ///
     /// * `mbr_primary`: A buffer containing the MBR block, primary GPT header and entries.
     /// * `resize`: If set to true, the method updates the last partition to cover the rest of the
-    ///    storage.
+    ///   storage.
     ///
     /// # Returns
     ///

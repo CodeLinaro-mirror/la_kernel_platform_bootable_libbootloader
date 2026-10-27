@@ -91,8 +91,8 @@ impl PrefixData {
 
     /// Reads prefix data based on ptr
     /// # SAFETY:
-    /// * `ptr` must be allocated by `gbl_malloc` and has enough padding before `ptr` to hold
-    /// prefix data. Which consists of offset and size values.
+    /// * `ptr` must be allocated by `gbl_malloc` and has enough padding before `ptr` to hold prefix
+    ///   data. Which consists of offset and size values.
     pub unsafe fn from_ptr(ptr: *mut u8) -> PrefixData {
         let mut prefix = PrefixData::default();
 

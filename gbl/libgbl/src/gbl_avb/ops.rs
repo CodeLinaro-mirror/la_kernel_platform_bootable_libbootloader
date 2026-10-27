@@ -207,8 +207,8 @@ impl<'a, 'b, 'c, 'p, T: GblOps<'p>> GblAvbOps<'a, 'b, 'c, T> {
     /// # Args
     /// * `result`: the result provided by the real [GblOps].
     /// * `fallback`: the result to fall back to if the op is unimplemented.
-    /// * `log_name`: if the fallback value is used, some logs will be printed
-    ///               containing this name and the fallback value.
+    /// * `log_name`: if the fallback value is used, some logs will be printed containing this name
+    ///   and the fallback value.
     ///
     /// # Returns
     /// If `result` is `Err(IoError::NotImplemented)`, returns `fallback`.

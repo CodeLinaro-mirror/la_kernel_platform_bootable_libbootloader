@@ -31,10 +31,10 @@ pub use liblp_bindgen::{
 /// This function may overflow, in which case the program may panic,
 /// depending on the compiler settings.
 /// # Arguments
-/// * `metadata_max_size` - The maximum size of a single metadata slot.
-/// Usually 65536, obtained from super partition's geometry structure.
-/// * `max_slots` - The maximum number of metadata slots. Usually 3.
-/// Obtained from super partition's geometry structure.
+/// * `metadata_max_size` - The maximum size of a single metadata slot. Usually 65536, obtained from
+///   super partition's geometry structure.
+/// * `max_slots` - The maximum number of metadata slots. Usually 3. Obtained from super partition's
+///   geometry structure.
 /// # Returns
 /// The total size of metadata area in bytes.
 pub fn get_total_metadata_size(metadata_max_size: u32, max_slots: u32) -> u32 {

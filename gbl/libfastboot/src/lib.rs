@@ -411,6 +411,7 @@ pub trait FastbootImplementation {
     ///   `VarInfoSender::send` for all combinations of Fastboot variable/argument/value that needs
     ///   to be included in the response to `fastboot getvarl all`:
     ///
+    ///   ```ignore
     ///   async fn get_var_all(&mut self, f: F, resp: impl VarInfoSender)
     ///     -> CommandResult<()> {
     ///       resp.send("partition-size", &["boot_a"], /* size of boot_a */).await?;
@@ -419,15 +420,18 @@ pub trait FastbootImplementation {
     ///       resp.send("partition-size", &["init_boot_b"], /* size of init_boot_b */).await?;
     ///       Ok(())
     ///   }
+    ///   ```
     ///
     ///   will generates the following outputs for `fastboot getvar all`:
     ///
+    ///   ```text
     ///   ...
     ///   (bootloader) partition-size:boot_a: <size of boot_a>
     ///   (bootloader) partition-size:boot_b: <size of boot_b>
     ///   (bootloader) partition-size:init_boot_a: <size of init_boot_a>
     ///   (bootloader) partition-size:init_boot_b: <size of init_boot_b>
     ///   ...
+    ///   ```
     ///
     /// TODO(b/465769208): This and `get_var()` contain duplicated logic. Investigate if there can
     /// be better solutions for doing the combination traversal.
@@ -621,7 +625,7 @@ pub trait FastbootImplementation {
     ///
     /// * DefaultImpl - Default implementation will run for the command if available.
     /// * CustomImpl - Vendor has overridden the command. `fastboot oem ...` is one of the cases
-    /// that is implemented using this approach.
+    ///   that is implemented using this approach.
     /// * Prohibited - shortcut for CustomImpl that just bans the command.
     async fn command_exec(
         &mut self,

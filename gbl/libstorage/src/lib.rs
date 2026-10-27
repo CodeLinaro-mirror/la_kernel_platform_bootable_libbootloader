@@ -610,7 +610,7 @@ impl<T: BlockIo, P: BufferPool> Disk<T, P> {
     ///
     /// * `mbr_primary`: A buffer containing the MBR block, primary GPT header and entries.
     /// * `resize`: If set to true, the method updates the last partition to cover the rest of the
-    ///    storage.
+    ///   storage.
     /// * `gpt`: The GPT to update.
     ///
     /// # Returns
@@ -741,8 +741,7 @@ mod test {
     ///
     /// # Arguments
     ///
-    /// * `index`: a slice index that should work on an 8-element [UninitSlice]
-    ///            and [u8]
+    /// * `index`: a slice index that should work on an 8-element [UninitSlice] and [u8]
     fn test_checked_get<T>(index: T)
     where
         // These traits are a little hairy, but it's basically just saying that

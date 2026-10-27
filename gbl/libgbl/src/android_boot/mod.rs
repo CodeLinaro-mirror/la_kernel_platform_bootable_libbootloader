@@ -621,7 +621,7 @@ where
     /// # Args
     ///
     /// * `buffer_pool`: An implementation of `BufferPool` wrapped in `Shared` for allocating
-    ///    download buffers.
+    ///   download buffers.
     /// * `tasks`: An implementation of `PinFutContainer` used as task container for GBL fastboot to
     ///   schedule dynamically spawned async tasks.
     /// * `transports`: Implementation of `GblGenericTransport` which exchanges fastboot packet

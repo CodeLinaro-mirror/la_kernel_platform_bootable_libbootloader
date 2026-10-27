@@ -737,7 +737,7 @@ impl<'a> BootServices<'a> {
     /// # Arguments
     /// * `event_type`: The EFI event type.
     /// * `cb`: An [EventNotify] which implements the event notification function and provides the
-    ///         task level priority setting.
+    ///   task level priority setting.
     ///
     /// # Safety
     /// Most of the safety conditions are enforced at compile-time by the [Sync] requirement on
@@ -753,6 +753,7 @@ impl<'a> BootServices<'a> {
     /// The easiest way to accomplish this is to write notifications callbacks that:
     /// * do not allocate or deallocate heap memory
     /// * do not panic
+    ///
     /// Callbacks following these guidelines are safe as they do not use the global [EfiEntry].
     ///
     /// If that is not possible, then the caller must ensure that nothing else makes any calls into

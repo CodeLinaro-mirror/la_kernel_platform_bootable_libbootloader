@@ -187,6 +187,7 @@ pub enum LoadPartition<'a> {
     /// It's up to the caller to ensure that:
     /// * `SpecializedPartition.name_buffer` is valid nul-terminated UTF-8
     /// * `SpecializedPartition.verification` is `Some`
+    ///
     /// or else trying to use this partition later will panic.
     PlatformSpecific(&'a SpecializedPartition),
 }

@@ -165,7 +165,7 @@ fn copy_bytes_right_align(src: &[u8], dst: &mut [u8]) -> Result<()> {
 ///
 /// * `values` - list of values to encode; its length must be a multiple of `cells` length
 /// * `tuple_cells` - list of cell sizes used to encode each n-tuple value; its length determines
-/// the n-tuple size
+///   the n-tuple size
 /// * `out_buffer` - output buffer to write encoded values into
 ///
 /// # Returns

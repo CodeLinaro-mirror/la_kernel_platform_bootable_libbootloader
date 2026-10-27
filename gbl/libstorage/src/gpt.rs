@@ -943,7 +943,7 @@ pub fn new_gpt_max() -> GptMax {
 /// * `disk`: to write GPT
 /// * `mbr_primary`: A buffer containing the MBR block, primary GPT header and entries.
 /// * `resize`: If set to true, the method updates the last partition to cover the rest of the
-///    storage.
+///   storage.
 /// * `gpt`: The output [Gpt] to update.
 pub(crate) async fn update_gpt(
     disk: &Disk<impl BlockIo, impl BufferPool>,
