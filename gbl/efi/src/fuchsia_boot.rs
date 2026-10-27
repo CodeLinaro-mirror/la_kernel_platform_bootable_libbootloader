@@ -50,7 +50,7 @@ pub fn is_fuchsia_gpt(disks: &[EfiGblDisk]) -> Result<()> {
     ];
     if !partitions
         .iter()
-        .all(|&partition| partition.iter().any(|v| check_part_unique(&disks[..], *v).is_ok()))
+        .all(|&partition| partition.iter().any(|v| check_part_unique(disks, *v).is_ok()))
     {
         return Err(Error::NotFound.into());
     }

@@ -144,7 +144,7 @@ pub fn wait_key_stroke(
     loop_with_timeout(efi_entry, timeout, || -> core::result::Result<Result<EfiInputKey>, bool> {
         match input.read_key_stroke() {
             Ok(Some(key)) if pred(key) => Ok(Ok(key)),
-            Err(e) => Ok(Err(e.into())),
+            Err(e) => Ok(Err(e)),
             _ => Err(false),
         }
     })?

@@ -437,7 +437,7 @@ impl<'a> PvmfwConfigBuilder<'a> {
 
         for (entry, (entry_len, padded_len)) in self.header.entries.iter_mut().zip(entry_sizes) {
             if entry_len > padded_len || padded_len % PvmfwConfEntry::ALIGNMENT != 0 {
-                return Err(Error::BadBufferSize.into());
+                return Err(Error::BadBufferSize);
             }
             entry.offset = total_size.try_into().map_err(Error::ArithmeticOverflow)?;
             entry.size = entry_len.try_into()?;

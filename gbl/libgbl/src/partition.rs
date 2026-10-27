@@ -203,19 +203,14 @@ where
     /// Creates a new instance as a GPT device.
     pub fn new_gpt(disk: Disk<B, P>, gpt: Gpt<T>) -> Self {
         let info_cache = disk.io().info();
-        Self {
-            disk: disk.into(),
-            info_cache,
-            partitions: PartitionTable::Gpt(gpt).into(),
-            is_gpt: true,
-        }
+        Self { disk, info_cache, partitions: PartitionTable::Gpt(gpt).into(), is_gpt: true }
     }
 
     /// Creates a new instance as a raw storage partition.
     pub fn new_raw(disk: Disk<B, P>, name: &CStr) -> Result<Self, Error> {
         let info_cache = disk.io().info();
         Ok(Self {
-            disk: disk.into(),
+            disk,
             info_cache,
             partitions: PartitionTable::Raw(RawName::new(name)?, info_cache.total_size()?).into(),
             is_gpt: false,
@@ -599,7 +594,7 @@ pub fn write_unique_partition_sync(
 pub async fn sync_gpt(
     devs: &'_ [GblDisk<Disk<impl BlockIo, impl BufferPool>, Gpt<impl DerefMut<Target = [u8]>>>],
 ) -> Result<(), Error> {
-    for ele in &devs[..] {
+    for ele in devs {
         ele.sync_gpt().await?;
     }
     Ok(())

@@ -249,7 +249,7 @@ impl<'a> DevicePathText<'a> {
 impl Display for DevicePathText<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         if let Some(text) = self.text {
-            for c in char::decode_utf16(text.into_iter().map(|v| *v)) {
+            for c in char::decode_utf16(text.into_iter().copied()) {
                 match c.unwrap_or(char::REPLACEMENT_CHARACTER) {
                     '\0' => break,
                     ch => write!(f, "{}", ch)?,

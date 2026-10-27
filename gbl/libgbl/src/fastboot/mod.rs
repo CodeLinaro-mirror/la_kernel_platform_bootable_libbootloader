@@ -1630,7 +1630,7 @@ where
                 let id: usize = FromHexStr::try_parse_next(&mut args)
                     .map_err(|_| CommandError::from("Missing block device ID"))?;
                 self.disks.get(id).ok_or("Out of range")?;
-                self.default_block = Some(id.try_into()?);
+                self.default_block = Some(id);
                 responder
                     .send_formatted_info(|f| write!(f, "Default block device: {id:#x}").unwrap())
                     .await?;
@@ -3309,7 +3309,7 @@ pub(crate) mod test {
         storage.add_gpt_device(include_bytes!("../../../libstorage/test/gpt_test_1.bin"));
         storage[0].get_blk_io().set_blocking(true);
         *storage[0].partition_io(None).unwrap().dev().io().error.borrow_mut() =
-            Some(liberror::Error::Other(Some("test"))).into();
+            Some(liberror::Error::Other(Some("test")));
 
         let mut gbl_ops = FakeGblOps::new(&storage);
         gbl_ops.avb_device_status.is_unlocked = true;

@@ -31,7 +31,7 @@ pub unsafe extern "C" fn strchr(ptr: *const c_char, ch: c_int) -> *mut c_char {
     loop {
         // SAFETY: `ptr` is a valid null-terminated string, and `cur` has not moved past its NUL
         // terminator, so `cur` is in bounds and readable.
-        let c = unsafe { *cur } as u8;
+        let c = unsafe { *cur.cast::<u8>() };
         if c == target {
             return cur as *mut c_char;
         }

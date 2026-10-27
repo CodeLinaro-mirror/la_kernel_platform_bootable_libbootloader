@@ -211,7 +211,7 @@ unsafe fn setup_bzimage_boot_params<'a>(
     cmdline: &[u8],
     low_mem_addr: usize,
 ) -> Result<&'a mut BootParams> {
-    let bootparam = BootParams::from_bytes_ref(&kernel[..])?;
+    let bootparam = BootParams::from_bytes_ref(kernel)?;
     bootparam.check()?;
 
     // low memory address must be non-null, aligned for `BootParams`, and <= 0x9_0000.

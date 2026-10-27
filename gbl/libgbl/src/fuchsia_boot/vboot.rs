@@ -310,8 +310,8 @@ mod test {
             ops.avb_ops.rollbacks,
             [
                 (1, Ok(2)),
-                (usize::try_from(CERT_PSK_VERSION_LOCATION).unwrap(), Ok(TEST_CERT_PSK_VERSION)),
-                (usize::try_from(CERT_PIK_VERSION_LOCATION).unwrap(), Ok(TEST_CERT_PIK_VERSION))
+                (CERT_PSK_VERSION_LOCATION, Ok(TEST_CERT_PSK_VERSION)),
+                (CERT_PIK_VERSION_LOCATION, Ok(TEST_CERT_PIK_VERSION))
             ]
             .into()
         );

@@ -451,16 +451,16 @@ impl<'a, 'b> EfiTcpSocket<'a, 'b> {
     /// Sends exactly `data.len()` number of bytes from `data`.
     pub async fn send_exact(&mut self, data: &[u8], timeout: Duration) -> Result<()> {
         let timer = Timeout::new(self.efi_entry, timeout)?;
-        let mut curr = &data[..];
+        let mut curr = data;
         let mut last_send_queue = self.get_socket().send_queue();
         loop {
             self.poll();
             if curr.is_empty() && self.get_socket().send_queue() == 0 {
                 return Ok(());
             } else if self.is_closed() {
-                return Err(Error::Disconnected.into());
+                return Err(Error::Disconnected);
             } else if timer.check()? {
-                return Err(Error::Timeout.into());
+                return Err(Error::Timeout);
             }
 
             let mut has_progress = false;

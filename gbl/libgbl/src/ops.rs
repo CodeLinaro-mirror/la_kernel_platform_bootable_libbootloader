@@ -315,7 +315,7 @@ pub trait GblOps<'a> {
         ]);
         default_partitions.retain(|p| !attributes.iter().any(|a| a.name_cstr() == p.name_cstr()));
 
-        Ok(attributes.into_iter().chain(default_partitions.into_iter()))
+        Ok(attributes.into_iter().chain(default_partitions))
     }
 
     /// Reads the AVB device status.

@@ -80,7 +80,7 @@ pub(crate) fn zbi_split_unused_buffer_mut(zbi: &mut [u8]) -> GblResult<(&mut [u8
 
 /// Same as zbi_split_unused_buffer_mut but on immutable slice.
 pub(crate) fn zbi_split_unused_buffer_ref(zbi: &[u8]) -> GblResult<(&[u8], &[u8])> {
-    Ok(zbi.split_at(ZbiContainer::parse(&zbi[..])?.container_size()?))
+    Ok(zbi.split_at(ZbiContainer::parse(zbi)?.container_size()?))
 }
 
 /// Gets the list of aliases for slotted/slotless zircon partition name.

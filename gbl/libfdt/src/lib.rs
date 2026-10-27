@@ -181,7 +181,7 @@ pub fn fdt_encode_cell_sized_property(
 ) -> Result<usize> {
     const FDT_CELL_SIZE: usize = 4; // 4 bytes per cell
     if tuple_cells.is_empty() || values.len() % tuple_cells.len() != 0 {
-        return Err(Error::InvalidInput.into());
+        return Err(Error::InvalidInput);
     }
     let total_size: usize = (SafeNum::from(FDT_CELL_SIZE) * values.len() / tuple_cells.len()
         * tuple_cells.iter().fold(SafeNum::from(0), |a, i| a + *i))
@@ -371,7 +371,7 @@ impl<'a, T: AsRef<[u8]> + 'a> Fdt<T> {
     /// Get a property from an existing node at the given node path.
     pub fn get_property(&self, path: &str, name: &CStr) -> Result<&[u8]> {
         let node = self.find_node_offset(path)?;
-        self.get_property_by_node_offset(node.try_into().unwrap(), name)
+        self.get_property_by_node_offset(node, name)
     }
 
     /// Treat the property value as a u32 and return it.
@@ -899,8 +899,7 @@ mod test {
 
         assert_eq!(
             CStr::from_bytes_with_nul(
-                fdt.get_property_by_node_offset(node_offset.try_into().unwrap(), c"property-1")
-                    .unwrap()
+                fdt.get_property_by_node_offset(node_offset, c"property-1").unwrap()
             )
             .unwrap()
             .to_str()
@@ -909,9 +908,7 @@ mod test {
         );
 
         // Non eixsts
-        assert!(fdt
-            .get_property_by_node_offset(node_offset.try_into().unwrap(), c"non-existent")
-            .is_err());
+        assert!(fdt.get_property_by_node_offset(node_offset, c"non-existent").is_err());
     }
 
     #[test]
@@ -1418,10 +1415,7 @@ mod test {
         let invalid_node_offset = usize::MAX;
 
         let strings_from_fdt: Vec<&str> = fdt
-            .get_property_stringlist_by_node_offset(
-                valid_prop_node_offset.try_into().unwrap(),
-                c"property-1",
-            )
+            .get_property_stringlist_by_node_offset(valid_prop_node_offset, c"property-1")
             .unwrap()
             .map(|cs| cs.to_str().unwrap())
             .collect();
@@ -1429,17 +1423,11 @@ mod test {
 
         // Not a valid stringlist
         assert!(fdt
-            .get_property_stringlist_by_node_offset(
-                invalid_prop_node_offset.try_into().unwrap(),
-                c"property-2"
-            )
+            .get_property_stringlist_by_node_offset(invalid_prop_node_offset, c"property-2")
             .is_err());
         // Non exists
         assert!(fdt
-            .get_property_stringlist_by_node_offset(
-                non_exist_prop_node_offset.try_into().unwrap(),
-                c"non-existent"
-            )
+            .get_property_stringlist_by_node_offset(non_exist_prop_node_offset, c"non-existent")
             .is_err());
         // Invalid node
         assert!(fdt
@@ -1464,10 +1452,10 @@ mod test {
         let fdt = Fdt::new_from_init(&mut fdt_buf[..], &init[..]).unwrap();
 
         let node_offset = fdt.find_node_offset("/dev-2/dev-2.2").unwrap();
-        assert!(fdt.get_first_subnode_offset(node_offset.try_into().unwrap()).is_ok());
+        assert!(fdt.get_first_subnode_offset(node_offset).is_ok());
 
         let leaf_offset = fdt.find_node_offset("/dev-2/dev-2.2/dev-2.2.1").unwrap();
-        assert!(fdt.get_first_subnode_offset(leaf_offset.try_into().unwrap()).is_err());
+        assert!(fdt.get_first_subnode_offset(leaf_offset).is_err());
     }
 
     #[test]

@@ -779,7 +779,7 @@ impl<B: DerefMut<Target = [u8]>> Gpt<B> {
             .as_bytes_mut()
             .get_mut(..entries_size)
             .ok_or(Error::GptError(GptError::EntriesTruncated))?;
-        entries_bytes.as_mut()[entries_size..].fill(0);
+        entries_bytes[entries_size..].fill(0);
         let entries_offset = SafeNum::from(header.entries) * blk_sz;
         disk.read(entries_offset.try_into()?, entries_bytes.as_mut()).await?;
         // Checks entries.

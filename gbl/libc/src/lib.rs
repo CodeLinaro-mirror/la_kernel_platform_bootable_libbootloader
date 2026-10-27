@@ -162,7 +162,7 @@ pub unsafe extern "C" fn gbl_malloc(request_size: usize, alignment: usize) -> *m
         // Calculate the offsets from the allocation start.
         let ret_offset = ret_address - (ptr as usize);
         let offset_offset: usize = (ret_offset - size_of_val(&prefix.size)).try_into().ok()?;
-        let size_offset: usize = (offset_offset - size_of_val(&prefix.offset)).try_into().ok()?;
+        let size_offset: usize = offset_offset - size_of_val(&prefix.offset);
         prefix.offset = usize::try_from(ret_offset).ok()?;
 
         // SAFETY:
@@ -302,7 +302,7 @@ pub unsafe extern "C" fn memchr(ptr: *const c_void, ch: c_int, count: usize) -> 
 #[cfg_attr(not(target_os = "linux"), no_mangle)]
 pub unsafe extern "C" fn strnlen(s: *const c_char, maxlen: usize) -> usize {
     // SAFETY: `s` is a valid pointer to a null terminated string.
-    match unsafe { memchr(s as *const _, 0, maxlen.try_into().unwrap()) } {
+    match unsafe { memchr(s as *const _, 0, maxlen) } {
         p if p.is_null() => maxlen,
         p => (p as usize) - (s as usize),
     }

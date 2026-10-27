@@ -38,7 +38,7 @@ fn relocate_kernel(kernel: &[u8], dest: &mut [u8]) -> GblResult<()> {
         return Err(Error::InvalidAlignment.into());
     }
 
-    let kernel = ZbiContainer::parse(&kernel[..])?;
+    let kernel = ZbiContainer::parse(kernel)?;
     let kernel_item = kernel.get_bootable_kernel_item()?;
     let hdr = kernel_item.header;
     // Creates a new ZBI kernel item at the destination.
@@ -241,7 +241,7 @@ mod test {
     ) -> AlignedBuffer {
         let mut expected_zbi_items = AlignedBuffer::new(256 * 1024, ZBI_ALIGNMENT_USIZE);
         let mut items = ZbiContainer::new(&mut expected_zbi_items[..]).unwrap();
-        items.extend(&ZbiContainer::parse(&expected_kernel[..]).unwrap()).unwrap();
+        items.extend(&ZbiContainer::parse(expected_kernel).unwrap()).unwrap();
         append_cmd_line(&mut expected_zbi_items, FakeGblOps::ADDED_ZBI_COMMANDLINE_CONTENTS);
         append_cmd_line(&mut expected_zbi_items, b"vb_prop_0=val\0");
         append_cmd_line(&mut expected_zbi_items, b"vb_prop_1=val\0");
@@ -527,7 +527,7 @@ mod test {
     ) -> AlignedBuffer {
         let mut expected_zbi_items = AlignedBuffer::new(256 * 1024, ZBI_ALIGNMENT_USIZE);
         let mut items = ZbiContainer::new(&mut expected_zbi_items[..]).unwrap();
-        items.extend(&ZbiContainer::parse(&expected_kernel[..]).unwrap()).unwrap();
+        items.extend(&ZbiContainer::parse(expected_kernel).unwrap()).unwrap();
         append_cmd_line(&mut expected_zbi_items, FakeGblOps::ADDED_ZBI_COMMANDLINE_CONTENTS);
         append_cmd_line(
             &mut expected_zbi_items,

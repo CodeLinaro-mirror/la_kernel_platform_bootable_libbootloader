@@ -954,9 +954,8 @@ impl<'a, T: Transport> Downloader for &mut Responder<'a, T> {
         match self.transport.receive(&mut out[..to_recv]).await {
             Ok((v, rem)) => {
                 self.download_state = DownloadState::InProgress(
-                    v.try_into()
-                        .ok()
-                        .and_then(|v| self.remaining().checked_sub(v))
+                    self.remaining()
+                        .checked_sub(v)
                         .ok_or(Error::Other(Some("Invalid receive size")))?,
                 );
                 if self.remaining() == 0 {
@@ -2002,7 +2001,7 @@ mod test {
 
     #[test]
     fn test_download() {
-        let download_content: Vec<u8> = (0..1024).into_iter().map(|v| v as u8).collect();
+        let download_content: Vec<u8> = (0..1024).map(|v| v as u8).collect();
         let mut transport = TestTransport::new();
         // Splits download into two batches.
         let (first, second) = download_content.as_slice().split_at(download_content.len() / 2);
@@ -2232,7 +2231,7 @@ mod test {
     #[test]
     fn test_upload() {
         let mut fastboot_impl: FastbootTest = Default::default();
-        let upload_content: Vec<u8> = (0..1024).into_iter().map(|v| v as u8).collect();
+        let upload_content: Vec<u8> = (0..1024).map(|v| v as u8).collect();
         let mut transport = TestTransport::new();
         transport.add_input(b"upload");
         fastboot_impl.upload_config = (
@@ -2355,7 +2354,7 @@ mod test {
         let mut fastboot_impl: FastbootTest = Default::default();
         fastboot_impl.download_handler = Some(&mut download_handler);
         fastboot_impl.vars = BTreeMap::from([(("max-download-size", &[][..]), "0x400")]);
-        let download_content: Vec<u8> = (0..1024).into_iter().map(|v| v as u8).collect();
+        let download_content: Vec<u8> = (0..1024).map(|v| v as u8).collect();
         let mut tcp_stream: TestTcpStream = Default::default();
         tcp_stream.add_input(TCP_HANDSHAKE_MESSAGE);
         // Add two commands and verify both are executed.
