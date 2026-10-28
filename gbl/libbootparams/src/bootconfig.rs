@@ -142,9 +142,9 @@ impl<'a> BootConfigBuilder<'a> {
     /// # Arguments
     ///
     /// * `item`: an item that will be written via `Display`
-    /// * `check`: a closure that will be called on the bootconfig line without the trailing
-    ///            `\n`. Returning `Err` from the closure will cancel the insertion, leaving
-    ///            the bootconfig unmodified.
+    /// * `check`: a closure that will be called on the bootconfig line without the trailing `\n`.
+    ///   Returning `Err` from the closure will cancel the insertion, leaving the bootconfig
+    ///   unmodified.
     ///
     /// # Returns
     ///

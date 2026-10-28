@@ -1245,7 +1245,7 @@ where
             // arbitrary data until we pass the data phase, so that we can send the error message
             // and process future fastboot commands.
             let to_upload = read_len.as_ref().cloned().unwrap_or(min(left, buffer.len()));
-            uploader.upload(&mut buffer[..to_upload]).await?;
+            uploader.upload(&buffer[..to_upload]).await?;
             left -= to_upload
         }
         read_len?;
@@ -1552,7 +1552,7 @@ where
         while upload_off < end {
             let to_send = min(usize::try_from(end - read_off)?, batch_sz);
             let read = part_io.read(read_off, &mut read_buf[..to_send]);
-            let send = uploader.upload(&mut send_buf[..usize::try_from(read_off - upload_off)?]);
+            let send = uploader.upload(&send_buf[..usize::try_from(read_off - upload_off)?]);
             let (read_res, send_res) = join(read, send).await;
             read_res?;
             send_res?;
@@ -1630,7 +1630,7 @@ where
                 let id: usize = FromHexStr::try_parse_next(&mut args)
                     .map_err(|_| CommandError::from("Missing block device ID"))?;
                 self.disks.get(id).ok_or("Out of range")?;
-                self.default_block = Some(id.try_into()?);
+                self.default_block = Some(id);
                 responder
                     .send_formatted_info(|f| write!(f, "Default block device: {id:#x}").unwrap())
                     .await?;
@@ -3309,7 +3309,7 @@ pub(crate) mod test {
         storage.add_gpt_device(include_bytes!("../../../libstorage/test/gpt_test_1.bin"));
         storage[0].get_blk_io().set_blocking(true);
         *storage[0].partition_io(None).unwrap().dev().io().error.borrow_mut() =
-            Some(liberror::Error::Other(Some("test"))).into();
+            Some(liberror::Error::Other(Some("test")));
 
         let mut gbl_ops = FakeGblOps::new(&storage);
         gbl_ops.avb_device_status.is_unlocked = true;
@@ -4605,7 +4605,7 @@ pub(crate) mod test {
     fn test_update_gpt_no_downloaded_gpt() {
         let disk = include_bytes!("../../../libstorage/test/gpt_test_1.bin");
         let mut storage = FakeGblOpsStorage::default();
-        storage.add_gpt_device(&disk);
+        storage.add_gpt_device(disk);
         let buffers = vec![Some(vec![0u8; KiB!(128)]); 2];
         let mut gbl_ops = FakeGblOps::new(&storage);
         gbl_ops.avb_device_status.is_unlocked = true;
@@ -4635,7 +4635,7 @@ pub(crate) mod test {
     fn test_update_gpt_bad_gpt() {
         let disk = include_bytes!("../../../libstorage/test/gpt_test_1.bin");
         let mut storage = FakeGblOpsStorage::default();
-        storage.add_gpt_device(&disk);
+        storage.add_gpt_device(disk);
         let buffers = vec![Some(vec![0u8; KiB!(128)]); 2];
         let mut gbl_ops = FakeGblOps::new(&storage);
         gbl_ops.avb_device_status.is_unlocked = true;
@@ -4675,8 +4675,8 @@ pub(crate) mod test {
     fn test_update_gpt_invalid_input() {
         let disk_orig = include_bytes!("../../../libstorage/test/gpt_test_1.bin");
         let mut storage = FakeGblOpsStorage::default();
-        storage.add_gpt_device(&disk_orig);
-        storage.add_gpt_device(&disk_orig);
+        storage.add_gpt_device(disk_orig);
+        storage.add_gpt_device(disk_orig);
         let buffers = vec![Some(vec![0u8; KiB!(128)]); 2];
         let mut gbl_ops = FakeGblOps::new(&storage);
         gbl_ops.avb_device_status.is_unlocked = true;

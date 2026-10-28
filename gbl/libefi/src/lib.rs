@@ -596,7 +596,7 @@ impl<'a> BootServices<'a> {
             LocatedHandles::new_allocated(
                 NonNull::new(handles).ok_or(Error::InvalidInput)?,
                 num_handles,
-                &self.efi_entry,
+                self.efi_entry,
             )
         })
     }
@@ -737,7 +737,7 @@ impl<'a> BootServices<'a> {
     /// # Arguments
     /// * `event_type`: The EFI event type.
     /// * `cb`: An [EventNotify] which implements the event notification function and provides the
-    ///         task level priority setting.
+    ///   task level priority setting.
     ///
     /// # Safety
     /// Most of the safety conditions are enforced at compile-time by the [Sync] requirement on
@@ -753,6 +753,7 @@ impl<'a> BootServices<'a> {
     /// The easiest way to accomplish this is to write notifications callbacks that:
     /// * do not allocate or deallocate heap memory
     /// * do not panic
+    ///
     /// Callbacks following these guidelines are safe as they do not use the global [EfiEntry].
     ///
     /// If that is not possible, then the caller must ensure that nothing else makes any calls into
@@ -1350,7 +1351,7 @@ impl<'a> IntoIterator for &EfiMemoryAttributesTable<'a> {
 
     fn into_iter(self) -> Self::IntoIter {
         let descriptor_size = usize::try_from(self.header.descriptor_size).unwrap();
-        let tail = &self.tail[..];
+        let tail = self.tail;
         EfiMemoryAttributesTableIter { descriptor_size, tail }
     }
 }
@@ -1842,7 +1843,7 @@ mod test {
                 return EFI_STATUS_DEVICE_ERROR;
             };
             // SAFETY: function safety docs require valid `num_handles`.
-            unsafe { *num_handles = num as usize };
+            unsafe { *num_handles = num };
             // SAFETY: function safety docs require valid `buf`.
             unsafe { *buf = handles as *mut EfiHandle };
 
@@ -2415,7 +2416,7 @@ mod test {
             });
 
             // Validate that the returned `EfiMemoryMap` contains only 1 EfiMemoryDescriptor.
-            assert_eq!(desc.into_iter().map(|v| *v).collect::<Vec<_>>(), descriptors[..1].to_vec());
+            assert_eq!(desc.into_iter().copied().collect::<Vec<_>>(), descriptors[..1].to_vec());
             // Validate that the returned `EfiMemoryMap` has the correct map_key.
             assert_eq!(desc.map_key(), map_key);
         })
@@ -2529,7 +2530,7 @@ mod test {
             // Pass an unaligned address.
             let desc = super::exit_boot_services(efi_entry, &mut aligned[size - 1..]).unwrap();
             // Validate that the returned `EfiMemoryMap` contains the correct EfiMemoryDescriptor.
-            assert_eq!(desc.into_iter().map(|v| *v).collect::<Vec<_>>(), descriptors[..2].to_vec());
+            assert_eq!(desc.into_iter().copied().collect::<Vec<_>>(), descriptors[..2].to_vec());
             // Validate that the returned `EfiMemoryMap` has the correct map_key.
             assert_eq!(desc.map_key(), map_key);
         });

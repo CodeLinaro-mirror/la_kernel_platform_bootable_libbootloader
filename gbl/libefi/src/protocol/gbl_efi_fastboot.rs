@@ -117,7 +117,7 @@ impl Protocol<'_, GblFastbootProtocol> {
                     v.iter_mut().zip(args).for_each(|(l, r)| *l = r);
                     // SAFETY: By safety requirement of this function `val` points to a
                     // NULL-terminated string.
-                    (cb.0)(&v, unsafe { CStr::from_ptr(val as _) })
+                    (cb.0)(v, unsafe { CStr::from_ptr(val as _) })
                 }
                 _ => (cb.0)(&[c"<Number of arguments exceeds limit>"], c""),
             }

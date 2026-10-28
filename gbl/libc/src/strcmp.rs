@@ -41,7 +41,7 @@ pub unsafe extern "C" fn strncmp(s1: *const c_char, s2: *const c_char, n: usize)
         // SAFETY: `i` is always within the bounds of `s1` and `s2` because it is limited by `n`,
         // and this statement is unreachable if a null character is already encountered in `s1`
         // or `s2`. Per C99 7.21.4p1, characters are interpreted as `unsigned char`.
-        let (l, r) = unsafe { (*(s1.add(i) as *const u8), *(s2.add(i) as *const u8)) };
+        let (l, r) = unsafe { (*s1.add(i).cast::<u8>(), *s2.add(i).cast::<u8>()) };
 
         let cmp = l.cmp(&r);
         if cmp != Ordering::Equal || l == 0 {

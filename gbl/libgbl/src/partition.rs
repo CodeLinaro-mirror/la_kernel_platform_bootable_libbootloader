@@ -203,19 +203,14 @@ where
     /// Creates a new instance as a GPT device.
     pub fn new_gpt(disk: Disk<B, P>, gpt: Gpt<T>) -> Self {
         let info_cache = disk.io().info();
-        Self {
-            disk: disk.into(),
-            info_cache,
-            partitions: PartitionTable::Gpt(gpt).into(),
-            is_gpt: true,
-        }
+        Self { disk, info_cache, partitions: PartitionTable::Gpt(gpt).into(), is_gpt: true }
     }
 
     /// Creates a new instance as a raw storage partition.
     pub fn new_raw(disk: Disk<B, P>, name: &CStr) -> Result<Self, Error> {
         let info_cache = disk.io().info();
         Ok(Self {
-            disk: disk.into(),
+            disk,
             info_cache,
             partitions: PartitionTable::Raw(RawName::new(name)?, info_cache.total_size()?).into(),
             is_gpt: false,
@@ -290,7 +285,7 @@ where
     /// # Returns
     ///
     /// * Returns `Ok(Some(sync_res))` if partition type is GPT and disk access is successful, where
-    ///  `sync_res` contains the GPT verification and restoration result.
+    ///   `sync_res` contains the GPT verification and restoration result.
     /// * Returns `Ok(None)` if partition type is not GPT.
     /// * Returns `Err` in other cases.
     pub async fn sync_gpt(&self) -> Result<Option<GptSyncResult>, Error> {
@@ -311,7 +306,7 @@ where
     ///
     /// * `mbr_primary`: A buffer containing the MBR block, primary GPT header and entries.
     /// * `resize`: If set to true, the method updates the last partition to cover the rest of the
-    ///    storage.
+    ///   storage.
     ///
     /// # Returns
     ///
@@ -507,7 +502,7 @@ impl<'a, B: BlockIo, P: BufferPool, A: AccessMode> MultiPartitionIo<'a, B, P, 1,
 impl<'a, B: BlockIo, P: BufferPool> MultiPartitionIo<'a, B, P, 1, ReadWrite> {
     /// Gets the block device.
     pub fn dev(&self) -> &Disk<B, P> {
-        &self.disks[0]
+        self.disks[0]
     }
 }
 
@@ -599,7 +594,7 @@ pub fn write_unique_partition_sync(
 pub async fn sync_gpt(
     devs: &'_ [GblDisk<Disk<impl BlockIo, impl BufferPool>, Gpt<impl DerefMut<Target = [u8]>>>],
 ) -> Result<(), Error> {
-    for ele in &devs[..] {
+    for ele in devs {
         ele.sync_gpt().await?;
     }
     Ok(())
@@ -725,7 +720,7 @@ pub(crate) mod test {
     #[test]
     fn test_find_partition_raw() {
         let disk = include_bytes!("../../libstorage/test/gpt_test_1.bin");
-        let raw = raw_disk(c"raw", &disk);
+        let raw = raw_disk(c"raw", disk);
 
         let raw_part = raw.find_partition(Some("raw")).unwrap();
         assert_eq!(raw_part.name().unwrap(), "raw");
@@ -778,7 +773,7 @@ pub(crate) mod test {
     #[test]
     fn test_read_partition_raw() {
         let disk = include_bytes!("../../libstorage/test/gpt_test_1.bin");
-        let raw = raw_disk(c"raw", &disk);
+        let raw = raw_disk(c"raw", disk);
         test_part_read(&raw, Some("raw"), disk, 1, 1024);
         test_part_read(&raw, None, disk, 1, 1024);
     }
@@ -814,9 +809,9 @@ pub(crate) mod test {
 
     #[test]
     fn test_write_partition_raw() {
-        let mut raw = raw_disk(c"raw", include_bytes!("../../libstorage/test/gpt_test_1.bin"));
-        test_part_write(&mut raw, Some("raw"), 1, 1024);
-        test_part_write(&mut raw, None, 1, 1024);
+        let raw = raw_disk(c"raw", include_bytes!("../../libstorage/test/gpt_test_1.bin"));
+        test_part_write(&raw, Some("raw"), 1, 1024);
+        test_part_write(&raw, None, 1, 1024);
     }
 
     #[test]
@@ -857,7 +852,7 @@ pub(crate) mod test {
         assert!(block_on(part_io.write(BOOT_A_OFF, &mut vec![0u8; to_usize(BOOT_A_SZ) + 1][..]))
             .is_err());
 
-        let raw = raw_disk(c"raw", &disk);
+        let raw = raw_disk(c"raw", disk);
         let part_io = raw.partition_io(Some("raw")).unwrap();
         assert!(block_on(part_io.read(GPT_DISK_1_SZ, &mut vec![0u8; 1][..])).is_err());
         assert!(block_on(part_io.read(0, &mut vec![0u8; to_usize(GPT_DISK_1_SZ) + 1][..])).is_err());
@@ -889,7 +884,7 @@ pub(crate) mod test {
         assert!(gpt.partition_io(Some("boot_a")).unwrap().sub(0, BOOT_A_SZ + 1).is_err());
         assert!(gpt.partition_io(Some("boot_a")).unwrap().sub(1, BOOT_A_SZ).is_err());
 
-        let raw = raw_disk(c"raw", &disk);
+        let raw = raw_disk(c"raw", disk);
         assert!(raw.partition_io(Some("raw")).unwrap().sub(0, GPT_DISK_1_SZ + 1).is_err());
         assert!(raw.partition_io(Some("raw")).unwrap().sub(1, GPT_DISK_1_SZ).is_err());
     }
@@ -1026,17 +1021,17 @@ pub(crate) mod test {
 
         let off = 512u64;
         let sz = 1024u64;
-        check_read_partition(&mut devs, "boot_a", boot_a, off, sz);
-        check_read_partition(&mut devs, "boot_b", boot_b, off, sz);
+        check_read_partition(&devs, "boot_a", boot_a, off, sz);
+        check_read_partition(&devs, "boot_b", boot_b, off, sz);
 
         let vendor_boot_a = include_bytes!("../../libstorage/test/vendor_boot_a.bin");
         let vendor_boot_b = include_bytes!("../../libstorage/test/vendor_boot_b.bin");
 
-        check_read_partition(&mut devs, "vendor_boot_a", vendor_boot_a, off, sz);
-        check_read_partition(&mut devs, "vendor_boot_b", vendor_boot_b, off, sz);
+        check_read_partition(&devs, "vendor_boot_a", vendor_boot_a, off, sz);
+        check_read_partition(&devs, "vendor_boot_b", vendor_boot_b, off, sz);
 
-        check_read_partition(&mut devs, "raw_0", &[0xaau8; 4 * 1024][..], off, sz);
-        check_read_partition(&mut devs, "raw_1", &[0x55u8; 4 * 1024][..], off, sz);
+        check_read_partition(&devs, "raw_0", &[0xaau8; 4 * 1024][..], off, sz);
+        check_read_partition(&devs, "raw_1", &[0x55u8; 4 * 1024][..], off, sz);
     }
 
     /// A test helper for `write_unique_partition_sync`
@@ -1063,12 +1058,12 @@ pub(crate) mod test {
 
         let off = 512u64;
         let sz = 1024u64;
-        check_write_partition(&mut devs, "boot_a", off, sz);
-        check_write_partition(&mut devs, "boot_b", off, sz);
-        check_write_partition(&mut devs, "vendor_boot_a", off, sz);
-        check_write_partition(&mut devs, "vendor_boot_b", off, sz);
-        check_write_partition(&mut devs, "raw_0", off, sz);
-        check_write_partition(&mut devs, "raw_1", off, sz);
+        check_write_partition(&devs, "boot_a", off, sz);
+        check_write_partition(&devs, "boot_b", off, sz);
+        check_write_partition(&devs, "vendor_boot_a", off, sz);
+        check_write_partition(&devs, "vendor_boot_b", off, sz);
+        check_write_partition(&devs, "raw_0", off, sz);
+        check_write_partition(&devs, "raw_1", off, sz);
     }
 
     #[test]

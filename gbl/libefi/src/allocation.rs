@@ -180,7 +180,7 @@ impl EfiAllocator {
     ///
     /// Errors are logged but ignored.
     fn deallocate_pages(&self, ptr: *mut u8, size: usize) {
-        let Some(ref entry) = self.state.efi_entry() else {
+        let Some(entry) = self.state.efi_entry() else {
             // After EFI_BOOT_SERVICES.ExitBootServices(), all allocated memory is considered
             // leaked and under full ownership of subsequent OS loader code.
             return;
@@ -209,7 +209,7 @@ impl EfiAllocator {
     /// Errors are logged but ignored.
     fn deallocate(&self, ptr: *mut u8) {
         match self.state.efi_entry() {
-            Some(ref entry) => {
+            Some(entry) => {
                 let _ = entry
                     .system_table_checked()
                     .and_then(|v| v.boot_services_checked())

@@ -211,7 +211,7 @@ unsafe fn setup_bzimage_boot_params<'a>(
     cmdline: &[u8],
     low_mem_addr: usize,
 ) -> Result<&'a mut BootParams> {
-    let bootparam = BootParams::from_bytes_ref(&kernel[..])?;
+    let bootparam = BootParams::from_bytes_ref(kernel)?;
     bootparam.check()?;
 
     // low memory address must be non-null, aligned for `BootParams`, and <= 0x9_0000.
@@ -273,13 +273,13 @@ unsafe fn setup_bzimage_boot_params<'a>(
 ///
 /// * `cmdline`: Command line argument blob.
 ///
-/// * `mmap_cb`: A caller provided callback for setting the e820 memory map. The callback takes in
-///     a mutable reference of e820 map entries (&mut [e820entry]). On success, it should return
-///     the number of used entries. On error, it can return a
-///     `Error::MemoryMapCallbackError(<code>)` to propagate a custom error code.
+/// * `mmap_cb`: A caller provided callback for setting the e820 memory map. The callback takes in a
+///   mutable reference of e820 map entries (&mut [e820entry]). On success, it should return the
+///   number of used entries. On error, it can return a `Error::MemoryMapCallbackError(<code>)` to
+///   propagate a custom error code.
 ///
 /// * `low_mem_addr`: The lowest memory touched by the bootloader section. This is where boot param
-///      starts.
+///   starts.
 ///
 /// * The API is not expected to return on success.
 ///

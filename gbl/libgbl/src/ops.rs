@@ -315,7 +315,7 @@ pub trait GblOps<'a> {
         ]);
         default_partitions.retain(|p| !attributes.iter().any(|a| a.name_cstr() == p.name_cstr()));
 
-        Ok(attributes.into_iter().chain(default_partitions.into_iter()))
+        Ok(attributes.into_iter().chain(default_partitions))
     }
 
     /// Reads the AVB device status.
@@ -1308,6 +1308,7 @@ pub(crate) mod test {
         /// but locked for AVB, which is currently needed by:
         ///    1. `test_zircon_main_fastboot_boot_fail_on_corrupted_images`
         ///    2. `test_zircon_main_fastboot_boot_fails_on_rollback_protection`
+        ///
         /// TODO(b/506730736): Remove this when fastboot boot via command override is supported.
         pub avb_read_device_status_handler:
             Option<&'a mut dyn FnMut() -> AvbIoResult<AvbDeviceStatus>>,

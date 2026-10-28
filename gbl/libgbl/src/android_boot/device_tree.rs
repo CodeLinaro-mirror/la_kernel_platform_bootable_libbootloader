@@ -124,8 +124,7 @@ pub fn fdt_select_from_boot_partitions<'b, 'a: 'b, 'c: 'b>(
         } else {
             return Err(Error::Other(Some(
                 "Invalid or unrecognized device tree format in boot/vendor_boot",
-            ))
-            .into());
+            )));
         }
     }
     if images.dtb_part.len() > 0 {

@@ -211,7 +211,7 @@ pub fn avb_verify_slot<'a, 'b: 'c, 'c>(
 
     let mut digest = None;
     let mut is_eio = false;
-    if let Some(ref verify_data) = verify_data {
+    if let Some(verify_data) = verify_data {
         assert!(
             verify_data.vbmeta_data().first().unwrap().partition_name() == c"vbmeta",
             "GBL requires the vbmeta partition as the top-level verification structure. Please \

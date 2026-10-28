@@ -194,10 +194,7 @@ mod test {
             let mut fixup_buffer = [0x0; 128];
             let bootconfig = c"foo=bar\nbaz".to_bytes_with_nul();
 
-            assert_eq!(
-                os_config_protocol.fixup_bootconfig(&bootconfig[..], &mut fixup_buffer),
-                Ok(0)
-            );
+            assert_eq!(os_config_protocol.fixup_bootconfig(bootconfig, &mut fixup_buffer), Ok(0));
         });
     }
 
@@ -243,10 +240,10 @@ mod test {
             let mut fixup_buffer = [0x0; 128];
 
             assert_eq!(
-                os_config_protocol.fixup_bootconfig(&EXPECTED_BOOTCONFIG[..], &mut fixup_buffer),
+                os_config_protocol.fixup_bootconfig(EXPECTED_BOOTCONFIG, &mut fixup_buffer),
                 Ok(EXPECTED_LEN),
             );
-            assert_eq!(&fixup_buffer[..EXPECTED_LEN], &EXPECTED_FIXUP[..],);
+            assert_eq!(&fixup_buffer[..EXPECTED_LEN], EXPECTED_FIXUP,);
         });
     }
 
@@ -271,7 +268,7 @@ mod test {
             let bootconfig = c"foo=bar\nbaz".to_bytes_with_nul();
 
             assert_eq!(
-                os_config_protocol.fixup_bootconfig(&bootconfig[..], &mut fixup_buffer),
+                os_config_protocol.fixup_bootconfig(bootconfig, &mut fixup_buffer),
                 Err(Error::InvalidInput)
             );
         });
@@ -304,7 +301,7 @@ mod test {
             let bootconfig = c"foo=bar\nbaz".to_bytes_with_nul();
 
             assert_eq!(
-                os_config_protocol.fixup_bootconfig(&bootconfig[..], &mut fixup_buffer),
+                os_config_protocol.fixup_bootconfig(bootconfig, &mut fixup_buffer),
                 Err(Error::BufferTooSmall(Some(EXPECTED_REQUESTED_FIXUP_SIZE))),
             );
         });

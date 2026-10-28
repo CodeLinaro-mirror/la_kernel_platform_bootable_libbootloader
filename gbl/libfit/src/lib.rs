@@ -123,9 +123,7 @@ impl<'a> Fit<'a> {
         let mut default_configuration_path: ArrayString<32> = ArrayString::new();
         write!(default_configuration_path, "{CONFIGURATIONS}/{default_string}")?;
 
-        self.fdt
-            .find_node_offset(default_configuration_path.as_str())
-            .map(|e| e.try_into().unwrap())
+        self.fdt.find_node_offset(default_configuration_path.as_str())
     }
 
     /// Return image offset in FIT FDT
@@ -270,10 +268,7 @@ mod test {
             CStr::from_bytes_with_nul(
                 fit_image
                     .fdt
-                    .get_property_by_node_offset(
-                        default_configuration_offset.try_into().unwrap(),
-                        c"description"
-                    )
+                    .get_property_by_node_offset(default_configuration_offset, c"description")
                     .unwrap()
             )
             .unwrap()

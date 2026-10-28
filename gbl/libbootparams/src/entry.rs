@@ -49,7 +49,7 @@ impl<'a> CommandlineParser<'a> {
     }
 
     fn remains(&self) -> &'a str {
-        &self.data.get(self.pos..).unwrap_or("")
+        self.data.get(self.pos..).unwrap_or("")
     }
 
     fn peek(&self) -> Option<char> {

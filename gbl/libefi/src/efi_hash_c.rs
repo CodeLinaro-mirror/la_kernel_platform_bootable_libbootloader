@@ -64,8 +64,7 @@ unsafe fn efi_sha_update<Algorithm: HashAlgorithm>(
 }
 
 /// Safety:
-/// * `hasher_ptr` points to a pointer to a valid Hasher<Algorithm> that has been
-/// initialized.
+/// * `hasher_ptr` points to a pointer to a valid Hasher<Algorithm> that has been initialized.
 /// * `out` is valid to write for core::mem::size_of::<Algorithm::DigestType>() bytes.
 unsafe fn efi_sha_final<Algorithm: HashAlgorithm>(
     hasher_ptr: *mut *mut Hasher<'static, Algorithm>,
@@ -119,8 +118,7 @@ pub unsafe extern "C" fn efi_sha256_update(
 /// Returns the digest from a Hasher<Sha256>.
 ///
 /// Safety:
-/// * `hasher_ptr` points to a pointer to a valid Hasher<Sha256> that has been
-/// initialized.
+/// * `hasher_ptr` points to a pointer to a valid Hasher<Sha256> that has been initialized.
 /// * `out` is valid to write for 32 bytes.
 #[no_mangle]
 pub unsafe extern "C" fn efi_sha256_final(
@@ -162,8 +160,7 @@ pub unsafe extern "C" fn efi_sha512_update(
 /// Returns the digest from a Hasher<Sha512>.
 ///
 /// Safety:
-/// * `hasher` points to a pointer to a valid Hasher<Sha512> that has been
-/// initialized.
+/// * `hasher` points to a pointer to a valid Hasher<Sha512> that has been initialized.
 /// * `out` is valid to write for 64 bytes.
 #[no_mangle]
 pub unsafe extern "C" fn efi_sha512_final(

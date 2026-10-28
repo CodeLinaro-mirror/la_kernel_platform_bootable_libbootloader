@@ -170,7 +170,7 @@ mod test {
     /// false if the given ZBI items are empty. Panics otherwise, since these
     /// are the only expected ZBI states in these tests.
     fn zbi_contains_vbmeta_items(zbi_items_buffer: &[u8]) -> bool {
-        let normalized = normalize_zbi(&zbi_items_buffer);
+        let normalized = normalize_zbi(zbi_items_buffer);
 
         let mut empty_zbi = AlignedBuffer::new(1024, ZBI_ALIGNMENT_USIZE);
         ZbiContainer::new(&mut empty_zbi[..]).unwrap();
@@ -310,8 +310,8 @@ mod test {
             ops.avb_ops.rollbacks,
             [
                 (1, Ok(2)),
-                (usize::try_from(CERT_PSK_VERSION_LOCATION).unwrap(), Ok(TEST_CERT_PSK_VERSION)),
-                (usize::try_from(CERT_PIK_VERSION_LOCATION).unwrap(), Ok(TEST_CERT_PIK_VERSION))
+                (CERT_PSK_VERSION_LOCATION, Ok(TEST_CERT_PSK_VERSION)),
+                (CERT_PIK_VERSION_LOCATION, Ok(TEST_CERT_PIK_VERSION))
             ]
             .into()
         );

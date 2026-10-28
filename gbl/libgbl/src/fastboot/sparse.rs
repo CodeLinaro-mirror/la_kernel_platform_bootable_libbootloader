@@ -157,7 +157,7 @@ pub async fn write_sparse_image(
     // First pass. Writes non-fill chunk and constructs `FillInfo`.
     let mut fill_off = 0usize;
     for _ in 0..sparse_header.total_chunks {
-        let header: ChunkHeader = copy_from(&mut sparse_img[curr..])?;
+        let header: ChunkHeader = copy_from(&sparse_img[curr..])?;
         let payload = &mut sparse_img[curr + size_of::<ChunkHeader>()..];
         let payload_sz = u64_mul(header.chunk_sz, sparse_header.blk_sz)?;
         let mut fill = FillInfo::new_skip(header.chunk_sz);

@@ -106,7 +106,7 @@ pub fn android_load_verify_fixup<'a, 'b>(
     for partition in STANDARD_PARTITIONS
         .iter()
         .copied()
-        .chain(requested_partitions.iter().map(|p| LoadPartition::PlatformSpecific(&p)))
+        .chain(requested_partitions.iter().map(|p| LoadPartition::PlatformSpecific(p)))
     {
         let b = match ops.get_partition_buffer(partition) {
             Ok(b) => {
@@ -540,7 +540,7 @@ fn finalize_bootconfig<'a, 'b, 'c>(
     }
     // Adds platform-specific bootconfig.
     builder.add_raw_lines_with(|bytes, out| {
-        Ok(ops.fixup_bootconfig(&bytes, out)?.map(|slice| slice.len()).unwrap_or(0))
+        Ok(ops.fixup_bootconfig(bytes, out)?.map(|slice| slice.len()).unwrap_or(0))
     })?;
 
     if let Some(metrics) = ops.get_metrics()
@@ -621,7 +621,7 @@ where
     /// # Args
     ///
     /// * `buffer_pool`: An implementation of `BufferPool` wrapped in `Shared` for allocating
-    ///    download buffers.
+    ///   download buffers.
     /// * `tasks`: An implementation of `PinFutContainer` used as task container for GBL fastboot to
     ///   schedule dynamically spawned async tasks.
     /// * `transports`: Implementation of `GblGenericTransport` which exchanges fastboot packet
@@ -1429,7 +1429,7 @@ pub(crate) mod tests {
         // Other FDT properties are as expected.
         for (path, property, res) in expected_fdt_property {
             assert_eq!(
-                fdt.get_property(&path, &property).ok(),
+                fdt.get_property(path, property).ok(),
                 res.clone(),
                 "{path}:{property:?} value doesn't match"
             );
@@ -1624,7 +1624,7 @@ pub(crate) mod tests {
     #[test]
     fn test_android_load_verify_fixup_v0_dtbo_slot_a() {
         let parts = &[("dtbo_a", "android/dtbo_a.img"), ("dtb_a", "android/dtb_a.img")];
-        let fdt_prop = Vec::from([EXPECTED_DTB_PROPS_A, EXPECTED_DTBO_PROPS_A].concat());
+        let fdt_prop = [EXPECTED_DTB_PROPS_A, EXPECTED_DTBO_PROPS_A].concat();
         test_android_load_verify_fixup_v2_or_lower(0, 'a', parts, &fdt_prop);
     }
 
@@ -1637,7 +1637,7 @@ pub(crate) mod tests {
     #[test]
     fn test_android_load_verify_fixup_v0_dtbo_slot_b() {
         let parts = &[("dtbo_b", "android/dtbo_b.img"), ("dtb_b", "android/dtb_b.img")];
-        let fdt_prop = Vec::from([EXPECTED_DTB_PROPS_B, EXPECTED_DTBO_PROPS_B].concat());
+        let fdt_prop = [EXPECTED_DTB_PROPS_B, EXPECTED_DTBO_PROPS_B].concat();
         test_android_load_verify_fixup_v2_or_lower(0, 'b', parts, &fdt_prop);
     }
 
@@ -1651,7 +1651,7 @@ pub(crate) mod tests {
     #[test]
     fn test_android_load_verify_fixup_v1_dtbo_slot_a() {
         let parts = &[("dtbo_a", "android/dtbo_a.img"), ("dtb_a", "android/dtb_a.img")];
-        let fdt_prop = Vec::from([EXPECTED_DTB_PROPS_A, EXPECTED_DTBO_PROPS_A].concat());
+        let fdt_prop = [EXPECTED_DTB_PROPS_A, EXPECTED_DTBO_PROPS_A].concat();
         test_android_load_verify_fixup_v2_or_lower(1, 'a', parts, &fdt_prop);
     }
 
@@ -1664,7 +1664,7 @@ pub(crate) mod tests {
     #[test]
     fn test_android_load_verify_fixup_v1_dtbo_slot_b() {
         let parts = &[("dtbo_b", "android/dtbo_b.img"), ("dtb_b", "android/dtb_b.img")];
-        let fdt_prop = Vec::from([EXPECTED_DTB_PROPS_B, EXPECTED_DTBO_PROPS_B].concat());
+        let fdt_prop = [EXPECTED_DTB_PROPS_B, EXPECTED_DTBO_PROPS_B].concat();
         test_android_load_verify_fixup_v2_or_lower(1, 'b', parts, &fdt_prop);
     }
 
@@ -1676,8 +1676,8 @@ pub(crate) mod tests {
 
     #[test]
     fn test_android_load_verify_fixup_v2_dtbo_slot_a() {
-        let parts = &[("dtbo_a".into(), "android/dtbo_a.img".into())];
-        let fdt_prop = Vec::from([EXPECTED_FDT_PROPS, EXPECTED_DTBO_PROPS_A].concat());
+        let parts = &[("dtbo_a", "android/dtbo_a.img")];
+        let fdt_prop = [EXPECTED_FDT_PROPS, EXPECTED_DTBO_PROPS_A].concat();
         test_android_load_verify_fixup_v2_or_lower(2, 'a', parts, &fdt_prop);
     }
 
@@ -1688,8 +1688,8 @@ pub(crate) mod tests {
 
     #[test]
     fn test_android_load_verify_fixup_v2_dtbo_slot_b() {
-        let parts = &[("dtbo_b".into(), "android/dtbo_b.img".into())];
-        let fdt_prop = Vec::from([EXPECTED_FDT_PROPS, EXPECTED_DTBO_PROPS_B].concat());
+        let parts = &[("dtbo_b", "android/dtbo_b.img")];
+        let fdt_prop = [EXPECTED_FDT_PROPS, EXPECTED_DTBO_PROPS_B].concat();
         test_android_load_verify_fixup_v2_or_lower(2, 'b', parts, &fdt_prop);
     }
 
@@ -1769,7 +1769,7 @@ pub(crate) mod tests {
     #[test]
     fn test_android_load_verify_fixup_v3_v3_no_init_boot_dtbo_slot_a() {
         let parts = &[("dtbo_a".into(), "android/dtbo_a.img".into())];
-        let fdt_prop = Vec::from([EXPECTED_FDT_PROPS, EXPECTED_DTBO_PROPS_A].concat());
+        let fdt_prop = [EXPECTED_FDT_PROPS, EXPECTED_DTBO_PROPS_A].concat();
         test_android_load_verify_fixup_v3_or_v4_no_init_boot(3, 3, 'a', "", parts, &fdt_prop);
     }
 
@@ -1788,7 +1788,7 @@ pub(crate) mod tests {
     #[test]
     fn test_android_load_verify_fixup_v3_v3_no_init_boot_dtbo_slot_b() {
         let parts = &[("dtbo_b".into(), "android/dtbo_b.img".into())];
-        let fdt_prop = Vec::from([EXPECTED_FDT_PROPS, EXPECTED_DTBO_PROPS_B].concat());
+        let fdt_prop = [EXPECTED_FDT_PROPS, EXPECTED_DTBO_PROPS_B].concat();
         test_android_load_verify_fixup_v3_or_v4_no_init_boot(3, 3, 'b', "", parts, &fdt_prop);
     }
 
@@ -1807,7 +1807,7 @@ pub(crate) mod tests {
     #[test]
     fn test_android_load_verify_fixup_v4_v3_no_init_boot_dtbo_slot_a() {
         let parts = &[("dtbo_a".into(), "android/dtbo_a.img".into())];
-        let fdt_prop = Vec::from([EXPECTED_FDT_PROPS, EXPECTED_DTBO_PROPS_A].concat());
+        let fdt_prop = [EXPECTED_FDT_PROPS, EXPECTED_DTBO_PROPS_A].concat();
         test_android_load_verify_fixup_v3_or_v4_no_init_boot(4, 3, 'a', "", parts, &fdt_prop);
     }
 
@@ -1826,7 +1826,7 @@ pub(crate) mod tests {
     #[test]
     fn test_android_load_verify_fixup_v4_v3_no_init_boot_dtbo_slot_b() {
         let parts = &[("dtbo_b".into(), "android/dtbo_b.img".into())];
-        let fdt_prop = Vec::from([EXPECTED_FDT_PROPS, EXPECTED_DTBO_PROPS_B].concat());
+        let fdt_prop = [EXPECTED_FDT_PROPS, EXPECTED_DTBO_PROPS_B].concat();
         test_android_load_verify_fixup_v3_or_v4_no_init_boot(4, 3, 'b', "", parts, &fdt_prop);
     }
 
@@ -1847,7 +1847,7 @@ pub(crate) mod tests {
     fn test_android_load_verify_fixup_v3_v4_no_init_boot_dtbo_slot_a() {
         let parts = &[("dtbo_a".into(), "android/dtbo_a.img".into())];
         let config = TEST_VENDOR_BOOTCONFIG;
-        let fdt_prop = Vec::from([EXPECTED_FDT_PROPS, EXPECTED_DTBO_PROPS_A].concat());
+        let fdt_prop = [EXPECTED_FDT_PROPS, EXPECTED_DTBO_PROPS_A].concat();
         test_android_load_verify_fixup_v3_or_v4_no_init_boot(3, 4, 'a', config, parts, &fdt_prop);
     }
 
@@ -1868,7 +1868,7 @@ pub(crate) mod tests {
     fn test_android_load_verify_fixup_v3_v4_no_init_boot_dtbo_slot_b() {
         let parts = &[("dtbo_b".into(), "android/dtbo_b.img".into())];
         let config = TEST_VENDOR_BOOTCONFIG;
-        let fdt_prop = Vec::from([EXPECTED_FDT_PROPS, EXPECTED_DTBO_PROPS_B].concat());
+        let fdt_prop = [EXPECTED_FDT_PROPS, EXPECTED_DTBO_PROPS_B].concat();
         test_android_load_verify_fixup_v3_or_v4_no_init_boot(3, 4, 'b', config, parts, &fdt_prop);
     }
 
@@ -1889,7 +1889,7 @@ pub(crate) mod tests {
     fn test_android_load_verify_fixup_v4_v4_no_init_boot_dtbo_slot_a() {
         let parts = &[("dtbo_a".into(), "android/dtbo_a.img".into())];
         let config = TEST_VENDOR_BOOTCONFIG;
-        let fdt_prop = Vec::from([EXPECTED_FDT_PROPS, EXPECTED_DTBO_PROPS_A].concat());
+        let fdt_prop = [EXPECTED_FDT_PROPS, EXPECTED_DTBO_PROPS_A].concat();
         test_android_load_verify_fixup_v3_or_v4_no_init_boot(4, 4, 'a', config, parts, &fdt_prop);
     }
 
@@ -1910,7 +1910,7 @@ pub(crate) mod tests {
     fn test_android_load_verify_fixup_v4_v4_no_init_boot_dtbo_slot_b() {
         let parts = &[("dtbo_b".into(), "android/dtbo_b.img".into())];
         let config = TEST_VENDOR_BOOTCONFIG;
-        let fdt_prop = Vec::from([EXPECTED_FDT_PROPS, EXPECTED_DTBO_PROPS_B].concat());
+        let fdt_prop = [EXPECTED_FDT_PROPS, EXPECTED_DTBO_PROPS_B].concat();
         test_android_load_verify_fixup_v3_or_v4_no_init_boot(4, 4, 'b', config, parts, &fdt_prop);
     }
 
@@ -2016,7 +2016,7 @@ pub(crate) mod tests {
     #[test]
     fn test_android_load_verify_fixup_v3_v3_init_boot_dtbo_slot_a() {
         let parts = &[("dtbo_a".into(), "android/dtbo_a.img".into())];
-        let fdt_prop = Vec::from([EXPECTED_FDT_PROPS, EXPECTED_DTBO_PROPS_A].concat());
+        let fdt_prop = [EXPECTED_FDT_PROPS, EXPECTED_DTBO_PROPS_A].concat();
         test_android_load_verify_fixup_v3_or_v4_init_boot(3, 3, 'a', "", parts, &fdt_prop);
     }
 
@@ -2028,7 +2028,7 @@ pub(crate) mod tests {
     #[test]
     fn test_android_load_verify_fixup_v3_v3_init_boot_dtbo_slot_b() {
         let parts = &[("dtbo_b".into(), "android/dtbo_b.img".into())];
-        let fdt_prop = Vec::from([EXPECTED_FDT_PROPS, EXPECTED_DTBO_PROPS_B].concat());
+        let fdt_prop = [EXPECTED_FDT_PROPS, EXPECTED_DTBO_PROPS_B].concat();
         test_android_load_verify_fixup_v3_or_v4_init_boot(3, 3, 'b', "", parts, &fdt_prop);
     }
 
@@ -2040,7 +2040,7 @@ pub(crate) mod tests {
     #[test]
     fn test_android_load_verify_fixup_v4_v3_init_boot_dtbo_slot_a() {
         let parts = &[("dtbo_a".into(), "android/dtbo_a.img".into())];
-        let fdt_prop = Vec::from([EXPECTED_FDT_PROPS, EXPECTED_DTBO_PROPS_A].concat());
+        let fdt_prop = [EXPECTED_FDT_PROPS, EXPECTED_DTBO_PROPS_A].concat();
         test_android_load_verify_fixup_v3_or_v4_init_boot(4, 3, 'a', "", parts, &fdt_prop);
     }
 
@@ -2052,7 +2052,7 @@ pub(crate) mod tests {
     #[test]
     fn test_android_load_verify_fixup_v4_v3_init_boot_dtbo_slot_b() {
         let parts = &[("dtbo_b".into(), "android/dtbo_b.img".into())];
-        let fdt_prop = Vec::from([EXPECTED_FDT_PROPS, EXPECTED_DTBO_PROPS_B].concat());
+        let fdt_prop = [EXPECTED_FDT_PROPS, EXPECTED_DTBO_PROPS_B].concat();
         test_android_load_verify_fixup_v3_or_v4_init_boot(4, 3, 'b', "", parts, &fdt_prop);
     }
 
@@ -2073,7 +2073,7 @@ pub(crate) mod tests {
     fn test_android_load_verify_fixup_v3_v4_init_boot_dtbo_slot_a() {
         let parts = &[("dtbo_a".into(), "android/dtbo_a.img".into())];
         let config = TEST_VENDOR_BOOTCONFIG;
-        let fdt_prop = Vec::from([EXPECTED_FDT_PROPS, EXPECTED_DTBO_PROPS_A].concat());
+        let fdt_prop = [EXPECTED_FDT_PROPS, EXPECTED_DTBO_PROPS_A].concat();
         test_android_load_verify_fixup_v3_or_v4_init_boot(3, 4, 'a', config, parts, &fdt_prop);
     }
 
@@ -2094,7 +2094,7 @@ pub(crate) mod tests {
     fn test_android_load_verify_fixup_v3_v4_init_boot_dtbo_slot_b() {
         let parts = &[("dtbo_b".into(), "android/dtbo_b.img".into())];
         let config = TEST_VENDOR_BOOTCONFIG;
-        let fdt_prop = Vec::from([EXPECTED_FDT_PROPS, EXPECTED_DTBO_PROPS_B].concat());
+        let fdt_prop = [EXPECTED_FDT_PROPS, EXPECTED_DTBO_PROPS_B].concat();
         test_android_load_verify_fixup_v3_or_v4_init_boot(3, 4, 'b', config, parts, &fdt_prop);
     }
 
@@ -2115,7 +2115,7 @@ pub(crate) mod tests {
     fn test_android_load_verify_fixup_v4_v4_init_boot_dtbo_slot_a() {
         let parts = &[("dtbo_a".into(), "android/dtbo_a.img".into())];
         let config = TEST_VENDOR_BOOTCONFIG;
-        let fdt_prop = Vec::from([EXPECTED_FDT_PROPS, EXPECTED_DTBO_PROPS_A].concat());
+        let fdt_prop = [EXPECTED_FDT_PROPS, EXPECTED_DTBO_PROPS_A].concat();
         test_android_load_verify_fixup_v3_or_v4_init_boot(4, 4, 'a', config, parts, &fdt_prop);
     }
 
@@ -2136,7 +2136,7 @@ pub(crate) mod tests {
     fn test_android_load_verify_fixup_v4_v4_init_boot_dtbo_slot_b() {
         let parts = &[("dtbo_b".into(), "android/dtbo_b.img".into())];
         let config = TEST_VENDOR_BOOTCONFIG;
-        let fdt_prop = Vec::from([EXPECTED_FDT_PROPS, EXPECTED_DTBO_PROPS_B].concat());
+        let fdt_prop = [EXPECTED_FDT_PROPS, EXPECTED_DTBO_PROPS_B].concat();
         test_android_load_verify_fixup_v3_or_v4_init_boot(4, 4, 'b', config, parts, &fdt_prop);
     }
 
@@ -2454,7 +2454,7 @@ pub(crate) mod tests {
 
     /// Helper for getting default FakeGblOps for tests.
     pub(crate) fn default_test_gbl_ops(storage: &FakeGblOpsStorage) -> FakeGblOps<'_> {
-        let mut ops = FakeGblOps::new(&storage);
+        let mut ops = FakeGblOps::new(storage);
         ops.avb_ops.rollbacks = HashMap::from([(TEST_ROLLBACK_INDEX_LOCATION, Ok(0))]);
         ops.avb_key_validation_status = Some(Ok(KeyValidationStatus::Valid));
         ops
@@ -2503,7 +2503,7 @@ pub(crate) mod tests {
         bootconfig.find(&format!("{PROTECTED_PROP}=1")).unwrap();
         bootconfig.find(&format!("{UNPROTECTED_PROP}=1")).unwrap();
 
-        let fdt = Fdt::new(&fdt[..]).unwrap();
+        let fdt = Fdt::new(fdt).unwrap();
         assert_eq!(
             fdt.get_property("/reserved-memory/pkvm_guest_firmware", std_props::COMPATIBLE)
                 .unwrap(),

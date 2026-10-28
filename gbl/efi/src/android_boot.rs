@@ -74,7 +74,7 @@ pub fn efi_android_boot(
 
         const EFI_PAGE_SIZE: u64 = efi_types::EFI_PAGE_SIZE as u64;
 
-        let fdt = Fdt::new(&fdt[..])?;
+        let fdt = Fdt::new(fdt)?;
         let systab_addr = entry.system_table().as_ptr() as usize;
 
         // Back the EFI memory map handed to Linux with firmware-reserved memory.
@@ -141,8 +141,7 @@ pub fn efi_android_boot(
                     let mmap_ptr = efi_mmap.buffer().as_ptr() as usize;
 
                     // Pass the Memory Map pointers and metadata
-                    efi_info.efi_memdesc_version =
-                        efi_mmap.descriptor_version().try_into().unwrap();
+                    efi_info.efi_memdesc_version = efi_mmap.descriptor_version();
                     efi_info.efi_memdesc_size = efi_mmap.descriptor_size().try_into().unwrap();
                     efi_info.efi_memmap_size = efi_mmap.buffer().len().try_into().unwrap();
                     efi_info.efi_memmap = (mmap_ptr & 0xFFFFFFFF).try_into().unwrap();

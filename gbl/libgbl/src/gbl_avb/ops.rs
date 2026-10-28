@@ -166,7 +166,7 @@ impl<'a, 'b, 'c, 'p, T: GblOps<'p>> GblAvbOps<'a, 'b, 'c, T> {
             .filter_map(|(location, &idx)| (idx > 0).then_some((location, idx)));
 
         // Saved key version rollback indexes
-        let key_version_indexes = self.key_versions.clone().into_iter().filter_map(|opt| opt);
+        let key_version_indexes = self.key_versions.into_iter().filter_map(|opt| opt);
 
         slot_indexes.chain(key_version_indexes).try_for_each(|(loc, idx)| {
             let stored = self.read_rollback_index(loc)?;
@@ -207,8 +207,8 @@ impl<'a, 'b, 'c, 'p, T: GblOps<'p>> GblAvbOps<'a, 'b, 'c, T> {
     /// # Args
     /// * `result`: the result provided by the real [GblOps].
     /// * `fallback`: the result to fall back to if the op is unimplemented.
-    /// * `log_name`: if the fallback value is used, some logs will be printed
-    ///               containing this name and the fallback value.
+    /// * `log_name`: if the fallback value is used, some logs will be printed containing this name
+    ///   and the fallback value.
     ///
     /// # Returns
     /// If `result` is `Err(IoError::NotImplemented)`, returns `fallback`.

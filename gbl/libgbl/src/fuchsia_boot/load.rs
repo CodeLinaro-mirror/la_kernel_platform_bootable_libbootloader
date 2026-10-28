@@ -38,7 +38,7 @@ fn relocate_kernel(kernel: &[u8], dest: &mut [u8]) -> GblResult<()> {
         return Err(Error::InvalidAlignment.into());
     }
 
-    let kernel = ZbiContainer::parse(&kernel[..])?;
+    let kernel = ZbiContainer::parse(kernel)?;
     let kernel_item = kernel.get_bootable_kernel_item()?;
     let hdr = kernel_item.header;
     // Creates a new ZBI kernel item at the destination.
@@ -241,7 +241,7 @@ mod test {
     ) -> AlignedBuffer {
         let mut expected_zbi_items = AlignedBuffer::new(256 * 1024, ZBI_ALIGNMENT_USIZE);
         let mut items = ZbiContainer::new(&mut expected_zbi_items[..]).unwrap();
-        items.extend(&ZbiContainer::parse(&expected_kernel[..]).unwrap()).unwrap();
+        items.extend(&ZbiContainer::parse(expected_kernel).unwrap()).unwrap();
         append_cmd_line(&mut expected_zbi_items, FakeGblOps::ADDED_ZBI_COMMANDLINE_CONTENTS);
         append_cmd_line(&mut expected_zbi_items, b"vb_prop_0=val\0");
         append_cmd_line(&mut expected_zbi_items, b"vb_prop_1=val\0");
@@ -282,7 +282,7 @@ mod test {
         kernel: &[u8],
         lock_state: LockState,
     ) {
-        let expected_kernel = read_test_data(&format!("zircon_{}.zbi", char::from(slot)));
+        let expected_kernel = read_test_data(format!("zircon_{}.zbi", char::from(slot)));
         let expected_zbi_items = match lock_state {
             fastboot::LockState::Locked => make_expected_zbi_items(slot, &expected_kernel),
             fastboot::LockState::Unlocked => {
@@ -527,7 +527,7 @@ mod test {
     ) -> AlignedBuffer {
         let mut expected_zbi_items = AlignedBuffer::new(256 * 1024, ZBI_ALIGNMENT_USIZE);
         let mut items = ZbiContainer::new(&mut expected_zbi_items[..]).unwrap();
-        items.extend(&ZbiContainer::parse(&expected_kernel[..]).unwrap()).unwrap();
+        items.extend(&ZbiContainer::parse(expected_kernel).unwrap()).unwrap();
         append_cmd_line(&mut expected_zbi_items, FakeGblOps::ADDED_ZBI_COMMANDLINE_CONTENTS);
         append_cmd_line(
             &mut expected_zbi_items,
@@ -551,7 +551,7 @@ mod test {
             zircon_main(&mut ops, &mut load_buffer[..], |_| {}).unwrap();
         assert_eq!(booted_slot, slot);
 
-        let expected_kernel = read_test_data(&format!("zircon_{}.zbi", char::from(slot)));
+        let expected_kernel = read_test_data(format!("zircon_{}.zbi", char::from(slot)));
         // vbmeta zbi items are ignored.
         let expected_zbi_items = make_expected_zbi_items_wo_avb(slot, &expected_kernel);
         assert_zbi_eq!(zbi_items, &expected_zbi_items);
@@ -583,7 +583,7 @@ mod test {
         set_one_shot_bootloader(&mut GblAbrOps(ops), true).unwrap();
         zircon_main(ops, &mut load_buffer[..], |fb| {
             listener.add_transport_input(format!("download:{:#x}", bootimg.len()).as_bytes());
-            listener.add_transport_input(&bootimg);
+            listener.add_transport_input(bootimg);
             listener.add_transport_input(b"boot");
             listener.add_transport_input(b"continue");
             fb.run_n::<2>(&mut vec![0u8; 256 * 1024], &mut [listener], Some(listener));

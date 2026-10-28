@@ -451,16 +451,16 @@ impl<'a, 'b> EfiTcpSocket<'a, 'b> {
     /// Sends exactly `data.len()` number of bytes from `data`.
     pub async fn send_exact(&mut self, data: &[u8], timeout: Duration) -> Result<()> {
         let timer = Timeout::new(self.efi_entry, timeout)?;
-        let mut curr = &data[..];
+        let mut curr = data;
         let mut last_send_queue = self.get_socket().send_queue();
         loop {
             self.poll();
             if curr.is_empty() && self.get_socket().send_queue() == 0 {
                 return Ok(());
             } else if self.is_closed() {
-                return Err(Error::Disconnected.into());
+                return Err(Error::Disconnected);
             } else if timer.check()? {
-                return Err(Error::Timeout.into());
+                return Err(Error::Timeout);
             }
 
             let mut has_progress = false;
@@ -590,7 +590,7 @@ impl<'a, 'b, 'c> EfiGblNetworkInternal<'a, 'b, 'c> {
             udp_rx_metadata_buffer: vec![PacketMetadata::EMPTY; 1],
             socket_storage: Default::default(),
             // Allocates 7(chosen randomly) extra TX frames. Revisits if it is not enough.
-            efi_net_dev: EfiNetworkDevice::new(snp, 7, &efi_entry),
+            efi_net_dev: EfiNetworkDevice::new(snp, 7, efi_entry),
             timestamp,
             notify_fn: None,
             notify: None,

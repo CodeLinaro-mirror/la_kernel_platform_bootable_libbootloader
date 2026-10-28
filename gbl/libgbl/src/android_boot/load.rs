@@ -73,7 +73,7 @@ impl<'a> BootImageV2Info<'a> {
             return Err(Error::InvalidInput);
         }
         // This is valid since v1/v2 are superset of v0.
-        let v0 = Ref::into_ref(Ref::<_, boot_img_hdr_v0>::from_prefix(&buffer[..]).unwrap().0);
+        let v0 = Ref::into_ref(Ref::<_, boot_img_hdr_v0>::from_prefix(buffer).unwrap().0);
         let page_size: usize = v0.page_size.try_into()?;
         let cmdline = cstr_bytes_to_str(&v0.cmdline[..])?;
         let kernel_range = page_aligned_range(page_size, v0.kernel_size, page_size)?;
@@ -127,7 +127,7 @@ impl BootImageV3Info {
     /// Gets the v3 base header.
     fn v3(buffer: &[u8]) -> &boot_img_hdr_v3 {
         // This is valid since v4 is superset of v3.
-        Ref::into_ref(Ref::from_prefix(&buffer[..]).unwrap().0)
+        Ref::into_ref(Ref::from_prefix(buffer).unwrap().0)
     }
 
     // Decodes the kernel cmdline
@@ -224,7 +224,7 @@ impl VendorBootImageInfo {
 
     /// Gets the v3 base header.
     fn v3(buffer: &[u8]) -> &vendor_boot_img_hdr_v3 {
-        Ref::into_ref(Ref::<_, _>::from_prefix(&buffer[..]).unwrap().0)
+        Ref::into_ref(Ref::<_, _>::from_prefix(buffer).unwrap().0)
     }
 
     // Decodes the vendor cmdline
@@ -311,7 +311,7 @@ fn log_and_parse_bootimg<'a, 'b>(
     ops: &mut impl GblOps<'a>,
     data: &'b [u8],
 ) -> Result<BootImage<&'b [u8]>, Error> {
-    let bootimg = BootImage::parse(&data[..]).map_err(Error::from)?;
+    let bootimg = BootImage::parse(data).map_err(Error::from)?;
     let ver_str = match bootimg {
         BootImage::V0(_) => "V0",
         BootImage::V1(_) => "V1",
@@ -476,7 +476,7 @@ fn load_v3_and_v4_verified<'a, 'b>(
     images.dtb_source = Some(DtComponentSource::VendorBoot);
     images.vendor_bootconfig = get_range(vendor_boot, &vendor_boot_info.bootconfig_range)?;
     images.kernel = get_range(boot, &boot_info.kernel_exact_range)?;
-    parse_vendor_ramdisks(&vendor_boot, &vendor_boot_info, is_recovery, &mut images.ramdisks)?;
+    parse_vendor_ramdisks(vendor_boot, &vendor_boot_info, is_recovery, &mut images.ramdisks)?;
 
     // Finds and loads vendor_kernel_boot partition if provided.
     let vendor_kernel_boot = get_verified_partition(
@@ -491,7 +491,7 @@ fn load_v3_and_v4_verified<'a, 'b>(
         let info = VendorBootImageInfo::new(vendor_kernel_boot)?;
         // DTB should be provided by vendor_kerenl_boot if it exists.
         images.dtb = get_range(vendor_kernel_boot, &info.dtb_range)?;
-        parse_vendor_ramdisks(&vendor_kernel_boot, &info, is_recovery, &mut images.ramdisks)?;
+        parse_vendor_ramdisks(vendor_kernel_boot, &info, is_recovery, &mut images.ramdisks)?;
     }
 
     // Loads generic ramdisk, which may come from either boot or init_boot.
@@ -538,7 +538,7 @@ pub(crate) fn aligned_tail_offset(
 /// Parses and returns the kernel image from a boot image.
 #[cfg(feature = "fuchsia")]
 pub fn get_kernel(boot: &[u8]) -> Result<&[u8], Error> {
-    match BootImage::parse(&boot[..]).map_err(Error::from)? {
+    match BootImage::parse(boot).map_err(Error::from)? {
         BootImage::V3(_) | BootImage::V4(_) => {
             boot.get(BootImageV3Info::new(boot)?.kernel_exact_range)
         }
@@ -622,7 +622,7 @@ impl<'a> BootBufferLoader<'a> {
                 assert_eq!(self.general_fdt, 0..0);
                 // Use the kernel's page size so the hypervisor's identity mapping covers the
                 // pvmfw region exactly.
-                let off = aligned_offset(&self.general, kernel_attrs.page_size)?;
+                let off = aligned_offset(self.general, kernel_attrs.page_size)?;
                 let sz = build_pvmfw_data_region(
                     ops,
                     &mut self.general[off..],
@@ -662,7 +662,7 @@ impl<'a> BootBufferLoader<'a> {
                 assert_eq!(self.bootconfig_sz, 0);
                 assert_eq!(self.general_fdt, 0..0);
                 assert!(self.general_kernel.is_none());
-                let off = aligned_offset(&self.general, KERNEL_ALIGNMENT)?;
+                let off = aligned_offset(self.general, KERNEL_ALIGNMENT)?;
                 let sz = decompress_kernel(ops, kernel, &mut self.general[off..])?;
                 let attrs = parse_kernel_attributes(&self.general[off..off + sz])?;
                 if off + attrs.reserved_size > self.general.len() {
@@ -709,8 +709,7 @@ impl<'a> BootBufferLoader<'a> {
             Some(v) => Ok(&mut v[self.ramdisk_sz..]),
             _ => {
                 // Moves FDT to the right most position to make more space for bootconfig fixup.
-                let off =
-                    aligned_tail_offset(&self.general, self.general_fdt.len(), FDT_ALIGNMENT)?;
+                let off = aligned_tail_offset(self.general, self.general_fdt.len(), FDT_ALIGNMENT)?;
                 self.general.copy_within(self.general_fdt.clone(), off);
                 self.general_fdt = off..off + self.general_fdt.len();
                 Ok(&mut self.general[self.ramdisk_sz..off])

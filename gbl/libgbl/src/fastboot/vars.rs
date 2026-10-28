@@ -115,7 +115,7 @@ impl PartHasSlot {
 /// of `i8` and `u8` is identical for ASCII characters used in partition names.
 fn lp_partition_name(partition: &LpMetadataPartition) -> Option<&str> {
     let name_bytes: &[u8] = unsafe {
-        core::slice::from_raw_parts(partition.name.as_ptr() as *const u8, partition.name.len())
+        core::slice::from_raw_parts(partition.name.as_ptr().cast::<u8>(), partition.name.len())
     };
     let end = name_bytes.iter().position(|&b| b == 0).unwrap_or(name_bytes.len());
     core::str::from_utf8(&name_bytes[..end]).ok()
@@ -622,7 +622,7 @@ where
             })
         });
 
-        let all_parts = gpt_parts.chain(dynamic_parts.into_iter());
+        let all_parts = gpt_parts.chain(dynamic_parts);
         for raw_part in all_parts {
             let part_name = raw_part.to_str();
             match split_partition_suffix(part_name) {
@@ -752,7 +752,7 @@ where
     ) -> CommandResult<()> {
         let res = self.get_part_has_slot_table().await;
         // Variable may be optional. Continues instead of erroring out.
-        if let Some(e) = res.clone().err() {
+        if let Some(e) = res.err() {
             gbl_println!(self.gbl_ops, "Failed to get slot_info for partitions, {e}");
             return Ok(());
         }

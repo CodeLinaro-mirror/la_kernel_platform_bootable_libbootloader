@@ -156,7 +156,7 @@ mod test {
                 avf_protocol.read_vendor_dice_handover(&mut handover_buffer),
                 Ok(EXPECTED_HANDOVER.len())
             );
-            assert_eq!(&handover_buffer[..EXPECTED_HANDOVER.len()], &EXPECTED_HANDOVER[..]);
+            assert_eq!(&handover_buffer[..EXPECTED_HANDOVER.len()], EXPECTED_HANDOVER);
         });
     }
 

@@ -249,7 +249,7 @@ impl<'a, T: TcpStream> Transport for TcpTransport<'a, T> {
     }
 
     async fn send_packet(&mut self, packet: &[u8]) -> Result<()> {
-        self.tcp.write_exact(&mut u64::try_from(packet.len())?.to_be_bytes()[..]).await?;
+        self.tcp.write_exact(&u64::try_from(packet.len())?.to_be_bytes()[..]).await?;
         self.tcp.write_exact(packet).await
     }
 }
@@ -411,6 +411,7 @@ pub trait FastbootImplementation {
     ///   `VarInfoSender::send` for all combinations of Fastboot variable/argument/value that needs
     ///   to be included in the response to `fastboot getvarl all`:
     ///
+    ///   ```ignore
     ///   async fn get_var_all(&mut self, f: F, resp: impl VarInfoSender)
     ///     -> CommandResult<()> {
     ///       resp.send("partition-size", &["boot_a"], /* size of boot_a */).await?;
@@ -419,15 +420,18 @@ pub trait FastbootImplementation {
     ///       resp.send("partition-size", &["init_boot_b"], /* size of init_boot_b */).await?;
     ///       Ok(())
     ///   }
+    ///   ```
     ///
     ///   will generates the following outputs for `fastboot getvar all`:
     ///
+    ///   ```text
     ///   ...
     ///   (bootloader) partition-size:boot_a: <size of boot_a>
     ///   (bootloader) partition-size:boot_b: <size of boot_b>
     ///   (bootloader) partition-size:init_boot_a: <size of init_boot_a>
     ///   (bootloader) partition-size:init_boot_b: <size of init_boot_b>
     ///   ...
+    ///   ```
     ///
     /// TODO(b/465769208): This and `get_var()` contain duplicated logic. Investigate if there can
     /// be better solutions for doing the combination traversal.
@@ -621,7 +625,7 @@ pub trait FastbootImplementation {
     ///
     /// * DefaultImpl - Default implementation will run for the command if available.
     /// * CustomImpl - Vendor has overridden the command. `fastboot oem ...` is one of the cases
-    /// that is implemented using this approach.
+    ///   that is implemented using this approach.
     /// * Prohibited - shortcut for CustomImpl that just bans the command.
     async fn command_exec(
         &mut self,
@@ -950,9 +954,8 @@ impl<'a, T: Transport> Downloader for &mut Responder<'a, T> {
         match self.transport.receive(&mut out[..to_recv]).await {
             Ok((v, rem)) => {
                 self.download_state = DownloadState::InProgress(
-                    v.try_into()
-                        .ok()
-                        .and_then(|v| self.remaining().checked_sub(v))
+                    self.remaining()
+                        .checked_sub(v)
                         .ok_or(Error::Other(Some("Invalid receive size")))?,
                 );
                 if self.remaining() == 0 {
@@ -1998,7 +2001,7 @@ mod test {
 
     #[test]
     fn test_download() {
-        let download_content: Vec<u8> = (0..1024).into_iter().map(|v| v as u8).collect();
+        let download_content: Vec<u8> = (0..1024).map(|v| v as u8).collect();
         let mut transport = TestTransport::new();
         // Splits download into two batches.
         let (first, second) = download_content.as_slice().split_at(download_content.len() / 2);
@@ -2228,7 +2231,7 @@ mod test {
     #[test]
     fn test_upload() {
         let mut fastboot_impl: FastbootTest = Default::default();
-        let upload_content: Vec<u8> = (0..1024).into_iter().map(|v| v as u8).collect();
+        let upload_content: Vec<u8> = (0..1024).map(|v| v as u8).collect();
         let mut transport = TestTransport::new();
         transport.add_input(b"upload");
         fastboot_impl.upload_config = (
@@ -2351,7 +2354,7 @@ mod test {
         let mut fastboot_impl: FastbootTest = Default::default();
         fastboot_impl.download_handler = Some(&mut download_handler);
         fastboot_impl.vars = BTreeMap::from([(("max-download-size", &[][..]), "0x400")]);
-        let download_content: Vec<u8> = (0..1024).into_iter().map(|v| v as u8).collect();
+        let download_content: Vec<u8> = (0..1024).map(|v| v as u8).collect();
         let mut tcp_stream: TestTcpStream = Default::default();
         tcp_stream.add_input(TCP_HANDSHAKE_MESSAGE);
         // Add two commands and verify both are executed.

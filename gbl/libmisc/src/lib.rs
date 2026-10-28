@@ -109,8 +109,7 @@ impl BootloaderMessage {
         Ok(Ref::into_ref(
             Ref::<_, BootloaderMessage>::new_from_prefix(buffer)
                 .ok_or(Error::BufferTooSmall(Some(core::mem::size_of::<BootloaderMessage>())))?
-                .0
-                .into(),
+                .0,
         ))
     }
 
