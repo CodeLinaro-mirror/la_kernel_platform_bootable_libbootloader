@@ -282,7 +282,7 @@ mod test {
         kernel: &[u8],
         lock_state: LockState,
     ) {
-        let expected_kernel = read_test_data(&format!("zircon_{}.zbi", char::from(slot)));
+        let expected_kernel = read_test_data(format!("zircon_{}.zbi", char::from(slot)));
         let expected_zbi_items = match lock_state {
             fastboot::LockState::Locked => make_expected_zbi_items(slot, &expected_kernel),
             fastboot::LockState::Unlocked => {
@@ -551,7 +551,7 @@ mod test {
             zircon_main(&mut ops, &mut load_buffer[..], |_| {}).unwrap();
         assert_eq!(booted_slot, slot);
 
-        let expected_kernel = read_test_data(&format!("zircon_{}.zbi", char::from(slot)));
+        let expected_kernel = read_test_data(format!("zircon_{}.zbi", char::from(slot)));
         // vbmeta zbi items are ignored.
         let expected_zbi_items = make_expected_zbi_items_wo_avb(slot, &expected_kernel);
         assert_zbi_eq!(zbi_items, &expected_zbi_items);
@@ -583,7 +583,7 @@ mod test {
         set_one_shot_bootloader(&mut GblAbrOps(ops), true).unwrap();
         zircon_main(ops, &mut load_buffer[..], |fb| {
             listener.add_transport_input(format!("download:{:#x}", bootimg.len()).as_bytes());
-            listener.add_transport_input(&bootimg);
+            listener.add_transport_input(bootimg);
             listener.add_transport_input(b"boot");
             listener.add_transport_input(b"continue");
             fb.run_n::<2>(&mut vec![0u8; 256 * 1024], &mut [listener], Some(listener));

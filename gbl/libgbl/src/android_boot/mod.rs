@@ -106,7 +106,7 @@ pub fn android_load_verify_fixup<'a, 'b>(
     for partition in STANDARD_PARTITIONS
         .iter()
         .copied()
-        .chain(requested_partitions.iter().map(|p| LoadPartition::PlatformSpecific(&p)))
+        .chain(requested_partitions.iter().map(|p| LoadPartition::PlatformSpecific(p)))
     {
         let b = match ops.get_partition_buffer(partition) {
             Ok(b) => {
@@ -540,7 +540,7 @@ fn finalize_bootconfig<'a, 'b, 'c>(
     }
     // Adds platform-specific bootconfig.
     builder.add_raw_lines_with(|bytes, out| {
-        Ok(ops.fixup_bootconfig(&bytes, out)?.map(|slice| slice.len()).unwrap_or(0))
+        Ok(ops.fixup_bootconfig(bytes, out)?.map(|slice| slice.len()).unwrap_or(0))
     })?;
 
     if let Some(metrics) = ops.get_metrics()
@@ -1429,7 +1429,7 @@ pub(crate) mod tests {
         // Other FDT properties are as expected.
         for (path, property, res) in expected_fdt_property {
             assert_eq!(
-                fdt.get_property(&path, &property).ok(),
+                fdt.get_property(path, property).ok(),
                 res.clone(),
                 "{path}:{property:?} value doesn't match"
             );
@@ -2454,7 +2454,7 @@ pub(crate) mod tests {
 
     /// Helper for getting default FakeGblOps for tests.
     pub(crate) fn default_test_gbl_ops(storage: &FakeGblOpsStorage) -> FakeGblOps<'_> {
-        let mut ops = FakeGblOps::new(&storage);
+        let mut ops = FakeGblOps::new(storage);
         ops.avb_ops.rollbacks = HashMap::from([(TEST_ROLLBACK_INDEX_LOCATION, Ok(0))]);
         ops.avb_key_validation_status = Some(Ok(KeyValidationStatus::Valid));
         ops

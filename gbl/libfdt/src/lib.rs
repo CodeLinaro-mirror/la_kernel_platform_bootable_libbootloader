@@ -1242,7 +1242,7 @@ mod test {
         let mut fdt = Fdt::new_from_init(&mut fdt_buf[..], &init[..]).unwrap();
 
         assert!(
-            fdt.multioverlay_apply(&[&overlay_basic[..]]).is_err(),
+            fdt.multioverlay_apply([&overlay_basic[..]]).is_err(),
             "expected the problem is catched when not enough space in the main fdt buffer"
         );
     }
@@ -1261,7 +1261,7 @@ mod test {
         let mut fdt = Fdt::new_from_init(&mut fdt_buf[..], &init[..]).unwrap();
 
         assert!(
-            fdt.multioverlay_apply(&[&overlay_corrupted[..]]).is_err(),
+            fdt.multioverlay_apply([&overlay_corrupted[..]]).is_err(),
             "expected the problem is catched when applying corrupted overlay"
         );
     }
@@ -1275,7 +1275,7 @@ mod test {
         let mut fdt = Fdt::new_from_init(&mut fdt_buf[..], &init[..]).unwrap();
 
         assert!(
-            fdt.multioverlay_apply(&[&overlay_wrong_path[..]]).is_err(),
+            fdt.multioverlay_apply([&overlay_wrong_path[..]]).is_err(),
             "expected the problem is catched when applying overlay with wrong target path"
         );
     }

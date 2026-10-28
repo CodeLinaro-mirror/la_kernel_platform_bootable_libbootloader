@@ -85,7 +85,7 @@ fn decompress_lz4(content: &[u8], out: &mut [u8]) -> Result<usize> {
     for block in blocks {
         match block {
             Ok(block) => {
-                out_pos += decompress_into(&block, &mut out[out_pos..])
+                out_pos += decompress_into(block, &mut out[out_pos..])
                     .map_err(|_| Error::Other(Some("Failed to decompress lz4 block")))?;
             }
             Err(e) => {

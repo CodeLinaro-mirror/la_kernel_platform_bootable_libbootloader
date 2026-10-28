@@ -170,7 +170,7 @@ mod test {
     /// false if the given ZBI items are empty. Panics otherwise, since these
     /// are the only expected ZBI states in these tests.
     fn zbi_contains_vbmeta_items(zbi_items_buffer: &[u8]) -> bool {
-        let normalized = normalize_zbi(&zbi_items_buffer);
+        let normalized = normalize_zbi(zbi_items_buffer);
 
         let mut empty_zbi = AlignedBuffer::new(1024, ZBI_ALIGNMENT_USIZE);
         ZbiContainer::new(&mut empty_zbi[..]).unwrap();

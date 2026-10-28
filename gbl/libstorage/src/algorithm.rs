@@ -325,9 +325,9 @@ pub(crate) async fn write_async(
         (data_addr_value.round_up(io.info().alignment) - data_addr_value).try_into()?,
         data.len(),
     );
-    let mut unaligned_data = &mut buffer_alignment_scratch[..unaligned_write];
+    let unaligned_data = &mut buffer_alignment_scratch[..unaligned_write];
     unaligned_data.clone_from_slice(&data[..unaligned_write]);
-    write_aligned_buffer(io, offset, &mut unaligned_data, block_alignment_scratch).await?;
+    write_aligned_buffer(io, offset, unaligned_data, block_alignment_scratch).await?;
     if unaligned_write == data.len() {
         return Ok(());
     }

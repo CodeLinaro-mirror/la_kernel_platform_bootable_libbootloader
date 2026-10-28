@@ -249,7 +249,7 @@ impl<'a, T: TcpStream> Transport for TcpTransport<'a, T> {
     }
 
     async fn send_packet(&mut self, packet: &[u8]) -> Result<()> {
-        self.tcp.write_exact(&mut u64::try_from(packet.len())?.to_be_bytes()[..]).await?;
+        self.tcp.write_exact(&u64::try_from(packet.len())?.to_be_bytes()[..]).await?;
         self.tcp.write_exact(packet).await
     }
 }

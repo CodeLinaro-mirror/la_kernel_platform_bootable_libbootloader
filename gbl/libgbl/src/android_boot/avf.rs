@@ -663,9 +663,8 @@ fn pvmfw_build_dice_handover<'a, 'b, T: AVFVerificationData>(
 
     // Get next handover
     let input_values = InputValues::new(code, config_desc, authority, mode, hidden);
-    let entry_size =
-        dice_android_handover_main_flow(&vendor_handover, &input_values, output_buffer)
-            .map_err(Error::DiceError)?;
+    let entry_size = dice_android_handover_main_flow(vendor_handover, &input_values, output_buffer)
+        .map_err(Error::DiceError)?;
 
     let (entry_padded_size, rest) = pad_entry_split_rest(output_buffer, entry_size)?;
     Ok((entry_size, entry_padded_size, rest))

@@ -314,10 +314,10 @@ const SLOT_SUFFIX_INVALID: &[u8] = b"\0";
 #[allow(non_snake_case)]
 pub extern "C" fn AbrGetSlotSuffix(slot_index: AbrSlotIndex) -> *const c_char {
     match slot_index.try_into() {
-        Ok(SlotIndex::A) => &SLOT_A_SUFFIX,
-        Ok(SlotIndex::B) => &SLOT_B_SUFFIX,
-        Ok(SlotIndex::R) => &SLOT_R_SUFFIX,
-        Err(_) => &SLOT_SUFFIX_INVALID,
+        Ok(SlotIndex::A) => SLOT_A_SUFFIX,
+        Ok(SlotIndex::B) => SLOT_B_SUFFIX,
+        Ok(SlotIndex::R) => SLOT_R_SUFFIX,
+        Err(_) => SLOT_SUFFIX_INVALID,
     }
     .as_ptr() as _
 }

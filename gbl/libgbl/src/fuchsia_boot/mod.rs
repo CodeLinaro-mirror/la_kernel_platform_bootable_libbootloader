@@ -51,7 +51,7 @@ pub(crate) struct GblAbrOps<'a, T: ?Sized>(pub &'a mut T);
 
 impl<'b, T: GblOps<'b> + ?Sized> AbrOps for GblAbrOps<'_, T> {
     fn read_abr_metadata(&mut self, out: &mut [u8]) -> abr::Result<()> {
-        let part = find_part_aliases(self.0, &ABR_PARTITION_ALIASES)
+        let part = find_part_aliases(self.0, ABR_PARTITION_ALIASES)
             .map_err(|_| "Failed to find A/B/R metadata partition")?;
         self.0
             .read_from_partition_sync(part, 0, out)
@@ -59,7 +59,7 @@ impl<'b, T: GblOps<'b> + ?Sized> AbrOps for GblAbrOps<'_, T> {
     }
 
     fn write_abr_metadata(&mut self, data: &mut [u8]) -> abr::Result<()> {
-        let part = find_part_aliases(self.0, &ABR_PARTITION_ALIASES)
+        let part = find_part_aliases(self.0, ABR_PARTITION_ALIASES)
             .map_err(|_| "Failed to find A/B/R metadata partition")?;
         self.0
             .write_to_partition_sync(part, 0, data)
@@ -277,7 +277,7 @@ pub(crate) mod test {
     }
 
     pub(crate) fn create_gbl_ops<'a>(partitions: &'a [TestGblDisk]) -> FakeGblOps<'a> {
-        let mut ops = FakeGblOps::new(&partitions);
+        let mut ops = FakeGblOps::new(partitions);
         ops.avb_ops.rollbacks = HashMap::from([
             (TEST_ROLLBACK_INDEX_LOCATION, Ok(0)),
             (AVB_CERT_PSK_VERSION_LOCATION.try_into().unwrap(), Ok(0)),

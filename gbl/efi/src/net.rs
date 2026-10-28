@@ -590,7 +590,7 @@ impl<'a, 'b, 'c> EfiGblNetworkInternal<'a, 'b, 'c> {
             udp_rx_metadata_buffer: vec![PacketMetadata::EMPTY; 1],
             socket_storage: Default::default(),
             // Allocates 7(chosen randomly) extra TX frames. Revisits if it is not enough.
-            efi_net_dev: EfiNetworkDevice::new(snp, 7, &efi_entry),
+            efi_net_dev: EfiNetworkDevice::new(snp, 7, efi_entry),
             timestamp,
             notify_fn: None,
             notify: None,

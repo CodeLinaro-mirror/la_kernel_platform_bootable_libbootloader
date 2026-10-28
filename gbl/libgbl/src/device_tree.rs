@@ -171,10 +171,10 @@ fn try_dt_totalsize_from_unaligned_bytes_ref(header: &[u8], buffer: &mut [u8]) -
 
     // Fdt header must be aligned, so copy to an aligned buffer.
     header_slice.copy_from_slice(
-        &header.get(..FDT_HEADER_SIZE).ok_or(Error::BufferTooSmall(Some(FDT_HEADER_SIZE)))?,
+        header.get(..FDT_HEADER_SIZE).ok_or(Error::BufferTooSmall(Some(FDT_HEADER_SIZE)))?,
     );
 
-    match FdtHeader::from_bytes_ref(&header_slice) {
+    match FdtHeader::from_bytes_ref(header_slice) {
         Ok(header) => Ok(header.totalsize()),
         Err(e) => Err(e),
     }

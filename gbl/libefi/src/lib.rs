@@ -596,7 +596,7 @@ impl<'a> BootServices<'a> {
             LocatedHandles::new_allocated(
                 NonNull::new(handles).ok_or(Error::InvalidInput)?,
                 num_handles,
-                &self.efi_entry,
+                self.efi_entry,
             )
         })
     }
