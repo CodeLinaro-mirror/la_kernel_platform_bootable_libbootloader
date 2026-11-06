@@ -175,11 +175,11 @@ impl MockEfiEntry {
     ///
     /// Writes the same output as the real implementation, through the mocked `ConOut`.
     pub fn println_fmt(&self, args: core::fmt::Arguments) {
-        libgblutils::writeln_with_timestamp(
+        let _ = libgblutils::writeln_with_timestamp(
             &mut self.system_table().con_out().unwrap(),
             "\r\n",
             args,
-        )
+        );
     }
 }
 

@@ -694,9 +694,8 @@ macro_rules! gbl_log_stack_usage {
 macro_rules! gbl_print {
     ( $ops:expr, $( $x:expr ),* $(,)? ) => {
         {
-            match $ops.console_out() {
-                Some(v) => write!(v, $($x,)*).unwrap(),
-                _ => {}
+            if let Some(v) = $ops.console_out() {
+                let _ = write!(v, $($x,)*);
             }
         }
     };
@@ -712,7 +711,7 @@ macro_rules! gbl_println {
         {
             let newline = $ops.console_newline();
             if let Some(v) = $ops.console_out() {
-                $crate::ops::writeln_with_timestamp(v, newline, format_args!($($x,)*));
+                let _ = $crate::ops::writeln_with_timestamp(v, newline, format_args!($($x,)*));
             }
         }
     };

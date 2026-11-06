@@ -229,12 +229,9 @@ impl EfiEntry {
     #[doc(hidden)]
     #[inline(never)]
     pub fn println_fmt(&self, args: core::fmt::Arguments) {
-        // Can also use EFI_TIMESTAMP_PROTOCOL if provided.
-        libgblutils::writeln_with_timestamp(
-            &mut self.system_table().con_out().unwrap(),
-            "\r\n",
-            args,
-        )
+        if let Ok(mut con_out) = self.system_table().con_out() {
+            let _ = libgblutils::writeln_with_timestamp(&mut con_out, "\r\n", args);
+        }
     }
 }
 
@@ -1508,7 +1505,9 @@ macro_rules! efi_print {
     ( $efi_entry:expr, $( $x:expr ),* $(,)? ) => {
         {
             use core::fmt::Write;
-            write!($efi_entry.system_table().con_out().unwrap(), $($x,)*).unwrap();
+            if let Ok(mut v) = $efi_entry.system_table().con_out() {
+                let _ = write!(v, $($x,)*);
+            }
         }
     };
 }
@@ -1521,7 +1520,7 @@ macro_rules! efi_print {
 macro_rules! efi_println {
     ( $efi_entry:expr, $( $x:expr ),* $(,)? ) => {
         {
-            $efi_entry.println_fmt(format_args!($($x,)*));
+            let _ = $efi_entry.println_fmt(format_args!($($x,)*));
         }
     };
 }

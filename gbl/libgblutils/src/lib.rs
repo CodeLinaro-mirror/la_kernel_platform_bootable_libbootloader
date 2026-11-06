@@ -179,12 +179,12 @@ pub fn writeln_with_timestamp(
     out: &mut dyn core::fmt::Write,
     newline: &str,
     args: core::fmt::Arguments,
-) {
+) -> core::fmt::Result {
     if let Ok(t) = arch_timestamp() {
-        write!(out, "[{}.{:04}] ", t.as_secs(), t.subsec_micros() / 100).unwrap();
+        write!(out, "[{}.{:04}] ", t.as_secs(), t.subsec_micros() / 100)?;
     }
-    out.write_fmt(args).unwrap();
-    out.write_str(newline).unwrap();
+    out.write_fmt(args)?;
+    out.write_str(newline)
 }
 
 #[cfg(test)]
