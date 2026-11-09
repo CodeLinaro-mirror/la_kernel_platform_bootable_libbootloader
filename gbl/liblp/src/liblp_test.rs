@@ -84,4 +84,27 @@ mod tests {
         let partition_name = to_cstr(&partition.name).unwrap().to_str().unwrap();
         assert_eq!(partition_name, "system_a");
     }
+
+    #[test]
+    fn parse_uses_primary_metadata_when_backup_is_corrupt() {
+        let mut buffer = fs::read(format!("{}/super.bin", TEST_DATA_PATH))
+            .expect("Failed to read testdata/super.bin");
+        let mut hasher = AvbHashOps::default();
+        let (max_size, slot_count) = {
+            let geometry = liblp::parse_geometry(&buffer, &mut hasher).unwrap();
+            (geometry.metadata_max_size as usize, geometry.metadata_slot_count as usize)
+        };
+
+        // The backup metadata copy starts right after all primary slots. Corrupt its header so
+        // that only the primary copy can satisfy the parse.
+        let backup_offset = liblp::LP_PARTITION_RESERVED_BYTES as usize
+            + 2 * liblp::LP_METADATA_GEOMETRY_SIZE as usize
+            + max_size * slot_count;
+        buffer[backup_offset] ^= 0xff;
+
+        let metadata = liblp::parse(&buffer, &mut hasher)
+            .expect("primary metadata must be used when the backup copy is corrupt");
+        let partition_name = to_cstr(&metadata.partitions[0].name).unwrap().to_str().unwrap();
+        assert_eq!(partition_name, "system_a");
+    }
 }

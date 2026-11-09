@@ -202,6 +202,9 @@ fn verify_table_checksum<'a>(
 /// Parses the primary or backup metadata from the buffer
 /// Input buffer should contain first N bytes of the super partition,
 /// where N >= reserved bytes + 2 * (geometry size + metadata size)
+///
+/// The primary metadata slot starts after both geometry copies and the backup copy follows all
+/// primary slots, so the backup is only consulted when the primary copy fails validation.
 pub fn parse_metadata<'a>(
     buffer: &'a [u8],
     metadata_max_size: u32,
@@ -217,7 +220,7 @@ pub fn parse_metadata<'a>(
         let table_buffer = verify_table_checksum(buffer, metadata, offset, hasher)?;
         Ok(ParseMetadataResult { metadata, table_buffer })
     };
-    try_parse(get_primary_geometry_offset())
+    try_parse(get_primary_metadata_offset())
         .or_else(|_| try_parse(get_backup_metadata_offset(metadata_max_size, metadata_slot_count)))
 }
 
