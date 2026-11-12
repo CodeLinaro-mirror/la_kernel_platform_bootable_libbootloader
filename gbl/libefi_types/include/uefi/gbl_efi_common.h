@@ -34,6 +34,22 @@ EFI_GUID(GBL_EFI_VENDOR_GUID, 0x5a6d92f3, 0xa2d0, 0x4083, 0x91, 0xa1, 0xa5,
 
 #define GBL_EFI_OS_BOOT_TARGET_VARNAME "gbl_os_boot_fuchsia"
 
+// `EFI_RUNTIME_SERVICES.ResetSystem()` `ResetData` passed by GBL for non-normal
+// reboots: a NUL-terminated CHAR16 reason string, followed by
+// `GBL_EFI_RESET_DATA_GUID` and a UINT8 bitmask of `GBL_EFI_RESET_DATA_FLAG_*`.
+// See gbl/docs/efi_integration.md.
+#define GBL_EFI_RESET_DATA_BOOTLOADER "bootloader"
+#define GBL_EFI_RESET_DATA_FASTBOOT "fastboot"
+#define GBL_EFI_RESET_DATA_RECOVERY "recovery"
+
+EFI_GUID(GBL_EFI_RESET_DATA_GUID, 0xb86bef58, 0x5d90, 0x41f1, 0xb7, 0x21, 0xb3,
+         0xe3, 0xb3, 0x15, 0x05, 0xfc);
+
+// GBL failed to persist the reboot target (e.g. missing `misc`). Firmware
+// may report it once via
+// `GBL_EFI_BOOT_CONTROL_PROTOCOL.GetOneShotBootMode()` on the next boot.
+#define GBL_EFI_RESET_DATA_FLAG_ONE_SHOT 0x01
+
 #define PARTITION_NAME_LEN_U16 36
 
 #endif /* __GBL_EFI_COMMON_H__ */

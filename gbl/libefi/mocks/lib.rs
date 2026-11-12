@@ -26,7 +26,7 @@ pub mod protocol;
 pub mod utils;
 
 use core::{convert::Infallible, time::Duration};
-use efi_types::{EfiConfigurationTable, EfiGuid, EfiTimerDelay};
+use efi_types::{EfiConfigurationTable, EfiGuid, EfiResetType, EfiStatus, EfiTimerDelay};
 use liberror::Result;
 use mockall::mock;
 use protocol::{
@@ -47,7 +47,9 @@ use std::cell::RefCell;
 /// libefi types that can be used in tests as-is.
 pub use efi::{
     efi_print, efi_println, opened_protocols, DeviceHandle, EventNotify, EventType, Tpl,
-    GBL_EFI_FW_API_LEVEL, GBL_EFI_VENDOR_GUID,
+    GBL_EFI_FW_API_LEVEL, GBL_EFI_RESET_DATA_BOOTLOADER, GBL_EFI_RESET_DATA_FASTBOOT,
+    GBL_EFI_RESET_DATA_FLAG_ONE_SHOT, GBL_EFI_RESET_DATA_GUID, GBL_EFI_RESET_DATA_RECOVERY,
+    GBL_EFI_VENDOR_GUID,
 };
 
 /// Holds state to set up a mock UEFI environment.
@@ -232,6 +234,9 @@ fn passthrough_system_table() -> MockSystemTable {
     table.expect_boot_services().returning(|| {
         MOCK_EFI.with_borrow_mut(|efi| efi.as_mut().unwrap().system_table.boot_services())
     });
+    table.expect_runtime_services().returning(|| {
+        MOCK_EFI.with_borrow_mut(|efi| efi.as_mut().unwrap().system_table.runtime_services())
+    });
     table
         .expect_con_out()
         .returning(|| MOCK_EFI.with_borrow_mut(|efi| efi.as_mut().unwrap().system_table.con_out()));
@@ -412,6 +417,14 @@ pub type Event<'a, 'b> = MockEvent;
 mock! {
     /// Mock [efi::RuntimeServices].
     pub RuntimeServices {
+        /// Wrapper of `EFI_RUNTIME_SERVICES.reset_system`.
+        pub fn reset_system<'a>(
+            &self,
+            reset_type: EfiResetType,
+            reset_status: EfiStatus,
+            reset_data: Option<&'a [u8]>,
+        ) -> Result<Infallible>;
+
         /// Performs a cold reset.
         pub fn cold_reset(&self) -> Result<Infallible>;
 

@@ -1369,28 +1369,47 @@ where
     }
 
     /// Sets the boot mode for the next reboot.
-    fn set_boot_mode(
+    ///
+    /// On Android, updating the `misc` BCB is best-effort so that `fastboot reboot-*` commands do
+    /// not hard-fail when `misc` is missing or not yet provisioned (e.g. during early factory
+    /// bringup): on failure, a warning is logged and sent to the host as `INFO`.
+    ///
+    /// Returns whether the boot mode was persisted.
+    async fn set_boot_mode(
         &mut self,
         gbl_ops: &mut impl GblOps<'a>,
         mode: AndroidBootMode,
-    ) -> CommandResult<()> {
-        match mode {
-            #[cfg(feature = "fuchsia")]
-            AndroidBootMode::BootloaderBootOnce if gbl_ops.expected_os_is_fuchsia()? => {
-                set_one_shot_bootloader(&mut GblAbrOps(gbl_ops), true)?;
+        responder: &mut impl InfoSender,
+    ) -> CommandResult<bool> {
+        #[cfg(feature = "fuchsia")]
+        if gbl_ops.expected_os_is_fuchsia()? {
+            match mode {
+                AndroidBootMode::BootloaderBootOnce => {
+                    set_one_shot_bootloader(&mut GblAbrOps(gbl_ops), true)?;
+                }
+                AndroidBootMode::Recovery => {
+                    set_one_shot_recovery(&mut GblAbrOps(gbl_ops), true)?;
+                }
+                _ => return Err(Error::Unsupported.into()),
             }
-            #[cfg(feature = "fuchsia")]
-            AndroidBootMode::Recovery if gbl_ops.expected_os_is_fuchsia()? => {
-                set_one_shot_recovery(&mut GblAbrOps(gbl_ops), true)?;
-            }
-            _ => {
-                // Update the bootloader message (BCB) in the `misc` partition.
-                let bcb = read_bootloader_message_to(gbl_ops, self.data.boot_buffer.scratch())?;
-                bcb.update_boot_command(mode);
-                write_bootloader_message(gbl_ops, bcb)?;
-            }
+            return Ok(true);
         }
-        Ok(())
+
+        if let Err(e) = read_bootloader_message_to(gbl_ops, self.data.boot_buffer.scratch())
+            .and_then(|bcb| {
+                bcb.update_boot_command(mode);
+                write_bootloader_message(gbl_ops, bcb)
+            })
+        {
+            gbl_println!(gbl_ops, "Warning: Failed to update BCB in misc partition: {e}");
+            responder
+                .send_formatted_info(|f| {
+                    let _ = write!(f, "Warning: Failed to update misc BCB ({e})");
+                })
+                .await?;
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     /// Drains background fastboot tasks if a pending background task could modify `misc`.
@@ -1538,24 +1557,24 @@ where
         mut resp: impl InfoSender + OkaySender,
     ) -> CommandResult<Infallible> {
         self.sync_tasks(gbl_ops, &mut resp, "Reboot").await;
-        let msg = match mode {
-            RebootMode::Normal => "Rebooting...",
-            RebootMode::Bootloader => {
-                self.set_boot_mode(gbl_ops, AndroidBootMode::BootloaderBootOnce)?;
-                "Rebooting to bootloader..."
-            }
-            RebootMode::Fastboot => {
-                self.set_boot_mode(gbl_ops, AndroidBootMode::Fastboot)?;
-                "Rebooting to userspace fastboot..."
-            }
-            RebootMode::Recovery => {
-                self.set_boot_mode(gbl_ops, AndroidBootMode::Recovery)?;
-                "Rebooting to recovery..."
-            }
+        let (persisted, msg) = match mode {
+            RebootMode::Normal => (true, "Rebooting..."),
+            RebootMode::Bootloader => (
+                self.set_boot_mode(gbl_ops, AndroidBootMode::BootloaderBootOnce, &mut resp).await?,
+                "Rebooting to bootloader...",
+            ),
+            RebootMode::Fastboot => (
+                self.set_boot_mode(gbl_ops, AndroidBootMode::Fastboot, &mut resp).await?,
+                "Rebooting to userspace fastboot...",
+            ),
+            RebootMode::Recovery => (
+                self.set_boot_mode(gbl_ops, AndroidBootMode::Recovery, &mut resp).await?,
+                "Rebooting to recovery...",
+            ),
         };
         resp.send_info(msg).await?;
         resp.send_okay("").await?;
-        Ok(gbl_ops.reboot()?)
+        Ok(gbl_ops.reboot(mode, !persisted)?)
     }
 
     /// Syncs all tasks and performs factory data reset.
@@ -7053,6 +7072,7 @@ pub(crate) mod test {
         reboot_command: &[u8],
         expected_info: &[u8],
         expected_boot_mode: AndroidBootMode,
+        expected_reboot_mode: RebootMode,
     ) {
         let mut storage = FakeGblOpsStorage::default();
         storage.add_raw_device(c"misc", [0u8; KiB!(4)]);
@@ -7080,12 +7100,18 @@ pub(crate) mod test {
         );
         let bcb = read_bootloader_message(&mut gbl_ops).unwrap();
         assert_eq!(bcb.boot_mode(), Ok(expected_boot_mode));
-        assert!(gbl_ops.rebooted);
+        assert_eq!(gbl_ops.last_reboot_mode, Some(expected_reboot_mode));
+        assert!(!gbl_ops.last_reboot_one_shot);
     }
 
     #[test]
     fn test_run_gbl_fastboot_reboot() {
-        test_fastboot_reboot(b"reboot", b"INFORebooting...", AndroidBootMode::Normal);
+        test_fastboot_reboot(
+            b"reboot",
+            b"INFORebooting...",
+            AndroidBootMode::Normal,
+            RebootMode::Normal,
+        );
     }
 
     #[test]
@@ -7094,6 +7120,7 @@ pub(crate) mod test {
             b"reboot-bootloader",
             b"INFORebooting to bootloader...",
             AndroidBootMode::BootloaderBootOnce,
+            RebootMode::Bootloader,
         );
     }
 
@@ -7103,6 +7130,7 @@ pub(crate) mod test {
             b"reboot-fastboot",
             b"INFORebooting to userspace fastboot...",
             AndroidBootMode::Fastboot,
+            RebootMode::Fastboot,
         );
     }
 
@@ -7112,6 +7140,94 @@ pub(crate) mod test {
             b"reboot-recovery",
             b"INFORebooting to recovery...",
             AndroidBootMode::Recovery,
+            RebootMode::Recovery,
+        );
+    }
+
+    fn test_fastboot_reboot_without_misc(
+        reboot_command: &[u8],
+        expected_packets: &[&[u8]],
+        expected_reboot_mode: RebootMode,
+    ) {
+        let storage = FakeGblOpsStorage::default();
+        let mut gbl_ops = FakeGblOps::new(&storage);
+        let buffers = vec![Some(vec![0u8; KiB!(128)]); 2];
+        let listener: SharedTestListener = Default::default();
+        let (transports, tcp) = (&mut [&listener], &listener);
+        let mut load_buffer = AlignedBuffer::new(MiB!(8), KERNEL_ALIGNMENT);
+
+        listener.add_transport_input(reboot_command);
+        listener.add_transport_input(b"continue");
+        block_on(run_gbl_fastboot_stack::<3>(
+            &mut gbl_ops,
+            buffers,
+            transports,
+            Some(tcp),
+            GblFbData { boot_buffer: (&mut load_buffer[..]).into(), ..Default::default() },
+        ));
+
+        assert_eq!(
+            listener.transport_out_queue(),
+            make_expected_transport_out(expected_packets),
+            "\nActual Transport output:\n{}",
+            listener.dump_transport_out_queue()
+        );
+        assert_eq!(gbl_ops.last_reboot_mode, Some(expected_reboot_mode));
+        // `misc` is missing, so firmware is asked to report the boot mode once.
+        assert_eq!(gbl_ops.last_reboot_one_shot, expected_reboot_mode != RebootMode::Normal);
+    }
+
+    #[test]
+    fn test_run_gbl_fastboot_reboot_without_misc() {
+        test_fastboot_reboot_without_misc(
+            b"reboot",
+            &[b"INFORebooting...", b"OKAY", b"FAILAborted", b"OKAY"],
+            RebootMode::Normal,
+        );
+    }
+
+    #[test]
+    fn test_run_gbl_fastboot_bootloader_without_misc() {
+        test_fastboot_reboot_without_misc(
+            b"reboot-bootloader",
+            &[
+                b"INFOWarning: Failed to update misc BCB (PartitionNotFound)",
+                b"INFORebooting to bootloader...",
+                b"OKAY",
+                b"FAILAborted",
+                b"OKAY",
+            ],
+            RebootMode::Bootloader,
+        );
+    }
+
+    #[test]
+    fn test_run_gbl_fastboot_reboot_fastboot_without_misc() {
+        test_fastboot_reboot_without_misc(
+            b"reboot-fastboot",
+            &[
+                b"INFOWarning: Failed to update misc BCB (PartitionNotFound)",
+                b"INFORebooting to userspace fastboot...",
+                b"OKAY",
+                b"FAILAborted",
+                b"OKAY",
+            ],
+            RebootMode::Fastboot,
+        );
+    }
+
+    #[test]
+    fn test_run_gbl_fastboot_reboot_recovery_without_misc() {
+        test_fastboot_reboot_without_misc(
+            b"reboot-recovery",
+            &[
+                b"INFOWarning: Failed to update misc BCB (PartitionNotFound)",
+                b"INFORebooting to recovery...",
+                b"OKAY",
+                b"FAILAborted",
+                b"OKAY",
+            ],
+            RebootMode::Recovery,
         );
     }
 
@@ -7149,7 +7265,8 @@ pub(crate) mod test {
         );
 
         assert_eq!(get_and_clear_one_shot_bootloader(&mut GblAbrOps(&mut gbl_ops)), Ok(true));
-        assert!(gbl_ops.rebooted);
+        assert_eq!(gbl_ops.last_reboot_mode, Some(RebootMode::Bootloader));
+        assert!(!gbl_ops.last_reboot_one_shot);
     }
 
     #[test]
@@ -7188,7 +7305,72 @@ pub(crate) mod test {
         // One shot recovery is set.
         assert_eq!(get_boot_slot(&mut GblAbrOps(&mut gbl_ops), true), (SlotIndex::R, false));
         assert_eq!(get_boot_slot(&mut GblAbrOps(&mut gbl_ops), true), (SlotIndex::A, false));
-        assert!(gbl_ops.rebooted);
+        assert_eq!(gbl_ops.last_reboot_mode, Some(RebootMode::Recovery));
+        assert!(!gbl_ops.last_reboot_one_shot);
+    }
+
+    #[test]
+    #[cfg(feature = "fuchsia")]
+    fn test_run_gbl_fastboot_fuchsia_reboot_missing_abr_fails() {
+        for cmd in [&b"reboot-bootloader"[..], b"reboot-recovery"] {
+            let storage = FakeGblOpsStorage::default();
+            let buffers = vec![Some(vec![0u8; KiB!(128)]); 2];
+            let mut gbl_ops = FakeGblOps::new(&storage);
+            gbl_ops.os = Some(Os::Fuchsia);
+            let listener: SharedTestListener = Default::default();
+            let (transports, tcp) = (&mut [&listener], &listener);
+
+            listener.add_transport_input(cmd);
+            listener.add_transport_input(b"continue");
+            block_on(run_gbl_fastboot_stack::<3>(
+                &mut gbl_ops,
+                buffers,
+                transports,
+                Some(tcp),
+                Default::default(),
+            ));
+
+            assert_eq!(listener.transport_out_queue().len(), 2);
+            assert!(listener.transport_out_queue()[0].starts_with(b"FAIL"));
+            assert_eq!(listener.transport_out_queue()[1].as_slice(), b"OKAY");
+            assert_eq!(gbl_ops.last_reboot_mode, None);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "fuchsia")]
+    fn test_run_gbl_fastboot_fuchsia_reboot_fastboot_unsupported_preserves_misc() {
+        // Legacy Fuchsia boards may store ABR metadata in `"misc"` (`&["misc", "durable_boot"]`).
+        // `reboot-fastboot` must reject with `Unsupported` without touching `"misc"`.
+        let mut storage = FakeGblOpsStorage::default();
+        storage.add_raw_device(c"misc", [0xa5u8; KiB!(4)]);
+        let buffers = vec![Some(vec![0u8; KiB!(128)]); 2];
+        let mut gbl_ops = FakeGblOps::new(&storage);
+        gbl_ops.os = Some(Os::Fuchsia);
+        let listener: SharedTestListener = Default::default();
+        let (transports, tcp) = (&mut [&listener], &listener);
+        let mut load_buffer = AlignedBuffer::new(MiB!(8), KERNEL_ALIGNMENT);
+
+        listener.add_transport_input(b"reboot-fastboot");
+        listener.add_transport_input(b"continue");
+        block_on(run_gbl_fastboot_stack::<3>(
+            &mut gbl_ops,
+            buffers,
+            transports,
+            Some(tcp),
+            GblFbData { boot_buffer: (&mut load_buffer[..]).into(), ..Default::default() },
+        ));
+
+        assert_eq!(
+            listener.transport_out_queue(),
+            make_expected_transport_out(&[b"FAILUnsupported", b"OKAY"]),
+            "\nActual Transport output:\n{}",
+            listener.dump_transport_out_queue()
+        );
+        assert_eq!(gbl_ops.last_reboot_mode, None);
+        let mut misc_bytes = vec![0u8; KiB!(4)];
+        gbl_ops.read_from_partition_sync("misc", 0, &mut misc_bytes[..]).unwrap();
+        assert_eq!(misc_bytes, vec![0xa5u8; KiB!(4)]);
     }
 
     #[test]

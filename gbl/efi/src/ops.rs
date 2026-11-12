@@ -39,13 +39,15 @@ use efi::{
         Protocol, Versioned,
     },
     utils::{find_fdt_configuration_table, parse_fw_api_level},
-    EfiEntry, GBL_EFI_FW_API_LEVEL, GBL_EFI_VENDOR_GUID,
+    EfiEntry, GBL_EFI_FW_API_LEVEL, GBL_EFI_RESET_DATA_BOOTLOADER, GBL_EFI_RESET_DATA_FASTBOOT,
+    GBL_EFI_RESET_DATA_FLAG_ONE_SHOT, GBL_EFI_RESET_DATA_GUID, GBL_EFI_RESET_DATA_RECOVERY,
+    GBL_EFI_VENDOR_GUID,
 };
 use efi_types::{
-    GblEfiAvbDeviceStatus, GblEfiAvbKeyValidationStatus, GblEfiAvbLoadedPartition,
+    EfiGuid, GblEfiAvbDeviceStatus, GblEfiAvbKeyValidationStatus, GblEfiAvbLoadedPartition,
     GblEfiAvbProperty, GblEfiAvbVerificationResult, GblEfiDeviceTreeMetadata,
-    GblEfiFastbootMessageType, GblEfiVerifiedDeviceTree, GBL_EFI_BOOT_BUFFER_TYPE_PVMFW_DATA,
-    GBL_EFI_FASTBOOT_COMMAND_EXEC_RESULT_CUSTOM_IMPL,
+    GblEfiFastbootMessageType, GblEfiVerifiedDeviceTree, EFI_RESET_TYPE_COLD, EFI_STATUS_SUCCESS,
+    GBL_EFI_BOOT_BUFFER_TYPE_PVMFW_DATA, GBL_EFI_FASTBOOT_COMMAND_EXEC_RESULT_CUSTOM_IMPL,
     GBL_EFI_FASTBOOT_COMMAND_EXEC_RESULT_DEFAULT_IMPL,
     GBL_EFI_FASTBOOT_COMMAND_EXEC_RESULT_PROHIBITED, GBL_EFI_FASTBOOT_MESSAGE_TYPE_FAIL,
     GBL_EFI_FASTBOOT_MESSAGE_TYPE_INFO, GBL_EFI_FASTBOOT_MESSAGE_TYPE_OKAY,
@@ -73,7 +75,7 @@ use libgbl::{
     ops::{
         AvbIoError, AvbIoResult, BootBufferType, CertPermanentAttributes, FailSender,
         FastbootPartitionType, InfoSender, LockState, LockType, OkaySender, OneShotBootMode,
-        PartitionBuffer, RngAlgorithm as GblRngAlgorithm, Slot, SHA256_DIGEST_SIZE,
+        PartitionBuffer, RebootMode, RngAlgorithm as GblRngAlgorithm, Slot, SHA256_DIGEST_SIZE,
     },
     partition::{GblDisk, RawName},
     GblOps, Os,
@@ -106,13 +108,13 @@ mod fuchsia {
     pub(super) const SMBIOS_TABLE_GUID: EfiGuid =
         EfiGuid::new(0xeb9d2d31, 0x2d88, 0x11d3, [0x9a, 0x16, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d]);
 }
-#[cfg(all(feature = "fuchsia", any(target_arch = "x86_64", test)))]
-use fuchsia::{
-    EfiGuid, ZbiFlags, ZbiType, ACPI_TABLE_GUID, EFI_ACPI_20_TABLE_GUID, SMBIOS3_TABLE_GUID,
-    SMBIOS_TABLE_GUID,
-};
 #[cfg(feature = "fuchsia")]
 use fuchsia::{Vec, ZbiContainer};
+#[cfg(all(feature = "fuchsia", any(target_arch = "x86_64", test)))]
+use fuchsia::{
+    ZbiFlags, ZbiType, ACPI_TABLE_GUID, EFI_ACPI_20_TABLE_GUID, SMBIOS3_TABLE_GUID,
+    SMBIOS_TABLE_GUID,
+};
 
 // Ensure the max partition name length in the image loading protocol matches the max image type
 // name length in GBL ops.
@@ -416,6 +418,27 @@ fn command_exec_message_sender(
     }
 }
 
+/// Encodes an ASCII string into a NUL-terminated UTF-16 (`EfiChar16`) array at compile time.
+const fn ascii_to_utf16_nul<const N: usize>(s: &str) -> [u16; N] {
+    let bytes = s.as_bytes();
+    assert!(bytes.len() + 1 == N, "output buffer size must equal ASCII length + 1 for NUL");
+    let mut out = [0u16; N];
+    let mut i = 0;
+    while i < bytes.len() {
+        assert!(bytes[i].is_ascii(), "reset data string must be ASCII");
+        out[i] = bytes[i] as u16;
+        i += 1;
+    }
+    out
+}
+
+const RESET_DATA_BOOTLOADER: [u16; 11] = ascii_to_utf16_nul(GBL_EFI_RESET_DATA_BOOTLOADER);
+const RESET_DATA_FASTBOOT: [u16; 9] = ascii_to_utf16_nul(GBL_EFI_RESET_DATA_FASTBOOT);
+const RESET_DATA_RECOVERY: [u16; 9] = ascii_to_utf16_nul(GBL_EFI_RESET_DATA_RECOVERY);
+/// Size of the largest `ResetData`: the longest reason string, the GUID and the flags byte.
+const RESET_DATA_MAX_SIZE: usize =
+    size_of_val(&RESET_DATA_BOOTLOADER) + size_of::<EfiGuid>() + size_of::<u8>();
+
 impl<'a, 'b> GblOps<'b> for Ops<'a, 'b> {
     fn console_out(&mut self) -> Option<&mut dyn Write> {
         Some(self)
@@ -426,9 +449,24 @@ impl<'a, 'b> GblOps<'b> for Ops<'a, 'b> {
         "\r\n"
     }
 
-    /// Reboots the system into the last set boot mode.
-    fn reboot(&mut self) -> Result<Infallible> {
-        self.efi_entry.system_table().runtime_services().cold_reset()
+    /// Reboots the system, passing `mode` and `one_shot` as `ResetData` to `ResetSystem()`.
+    ///
+    /// `ResetData` is the NUL-terminated UTF-16 reason string, followed by
+    /// `GBL_EFI_RESET_DATA_GUID` and a flags byte (see `gbl/docs/efi_integration.md`).
+    fn reboot(&mut self, mode: RebootMode, one_shot: bool) -> Result<Infallible> {
+        let rt = self.efi_entry.system_table().runtime_services();
+        let reason: &[u16] = match mode {
+            RebootMode::Normal => return rt.cold_reset(),
+            RebootMode::Bootloader => &RESET_DATA_BOOTLOADER,
+            RebootMode::Fastboot => &RESET_DATA_FASTBOOT,
+            RebootMode::Recovery => &RESET_DATA_RECOVERY,
+        };
+        let flags = if one_shot { GBL_EFI_RESET_DATA_FLAG_ONE_SHOT } else { 0 };
+        let mut data = ArrayVec::<u8, RESET_DATA_MAX_SIZE>::new();
+        data.try_extend_from_slice(reason.as_bytes()).unwrap();
+        data.try_extend_from_slice(GBL_EFI_RESET_DATA_GUID.as_bytes()).unwrap();
+        data.push(flags);
+        rt.reset_system(EFI_RESET_TYPE_COLD, EFI_STATUS_SUCCESS, Some(&data))
     }
 
     fn disks(
@@ -2924,6 +2962,82 @@ mod test {
             // Error catched.
             Err(Error::AccessDenied),
         );
+    }
+
+    #[test]
+    fn test_reboot_normal_calls_cold_reset() {
+        let mut mock_efi = MockEfi::new();
+        let mut rt = efi::MockRuntimeServices::default();
+        rt.expect_cold_reset().once().returning(|| Err(Error::Aborted));
+        mock_efi.system_table.expect_runtime_services().return_once(move || rt);
+
+        let installed = mock_efi.install();
+        let mut ops = Ops::new(installed.entry(), &[], None, 0);
+        assert_eq!(ops.reboot(RebootMode::Normal, false), Err(Error::Aborted));
+    }
+
+    /// Helper for testing that `Ops::reboot()` passes `expected_reason` (NUL-terminated UTF-16),
+    /// `GBL_EFI_RESET_DATA_GUID` and `expected_flags` as `ResetSystem()` `ResetData`.
+    fn test_reboot_reset_data(
+        mode: RebootMode,
+        one_shot: bool,
+        expected_reason: &str,
+        expected_flags: u8,
+    ) {
+        let expected_utf16: Vec<u16> =
+            expected_reason.encode_utf16().chain(core::iter::once(0)).collect();
+        let mut expected_bytes = expected_utf16.as_bytes().to_vec();
+        // `GBL_EFI_RESET_DATA_GUID` (b86bef58-5d90-41f1-b721-b3e3b31505fc) in EFI_GUID
+        // little-endian layout, followed by the flags byte.
+        expected_bytes.extend_from_slice(&[
+            0x58, 0xef, 0x6b, 0xb8, 0x90, 0x5d, 0xf1, 0x41, 0xb7, 0x21, 0xb3, 0xe3, 0xb3, 0x15,
+            0x05, 0xfc,
+        ]);
+        expected_bytes.push(expected_flags);
+
+        let mut mock_efi = MockEfi::new();
+        let mut rt = efi::MockRuntimeServices::default();
+        rt.expect_reset_system().once().returning(move |reset_type, reset_status, reset_data| {
+            assert_eq!(reset_type, EFI_RESET_TYPE_COLD);
+            assert_eq!(reset_status, EFI_STATUS_SUCCESS);
+            assert_eq!(reset_data, Some(expected_bytes.as_slice()));
+            Err(Error::Aborted)
+        });
+        mock_efi.system_table.expect_runtime_services().return_once(move || rt);
+
+        let installed = mock_efi.install();
+        let mut ops = Ops::new(installed.entry(), &[], None, 0);
+        assert_eq!(ops.reboot(mode, one_shot), Err(Error::Aborted));
+    }
+
+    #[test]
+    fn test_reboot_bootloader_reset_data() {
+        test_reboot_reset_data(RebootMode::Bootloader, false, "bootloader", 0);
+    }
+
+    #[test]
+    fn test_reboot_bootloader_one_shot_reset_data() {
+        test_reboot_reset_data(RebootMode::Bootloader, true, "bootloader", 0x01);
+    }
+
+    #[test]
+    fn test_reboot_fastboot_reset_data() {
+        test_reboot_reset_data(RebootMode::Fastboot, false, "fastboot", 0);
+    }
+
+    #[test]
+    fn test_reboot_fastboot_one_shot_reset_data() {
+        test_reboot_reset_data(RebootMode::Fastboot, true, "fastboot", 0x01);
+    }
+
+    #[test]
+    fn test_reboot_recovery_reset_data() {
+        test_reboot_reset_data(RebootMode::Recovery, false, "recovery", 0);
+    }
+
+    #[test]
+    fn test_reboot_recovery_one_shot_reset_data() {
+        test_reboot_reset_data(RebootMode::Recovery, true, "recovery", 0x01);
     }
 
     #[cfg(feature = "fuchsia")]

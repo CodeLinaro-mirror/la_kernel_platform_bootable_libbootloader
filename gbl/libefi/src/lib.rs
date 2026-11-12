@@ -284,6 +284,29 @@ pub const GBL_EFI_OS_BOOT_TARGET_VARNAME: &str = "gbl_os_boot_fuchsia";
 /// This must have the same `YYYYMM` format as the ro.board.api_level system property.
 pub const GBL_EFI_FW_API_LEVEL: &str = "gbl_fw_api_level";
 
+/// `ResetData` reason string (encoded as NUL-terminated UTF-16) passed to
+/// `EFI_RUNTIME_SERVICES.ResetSystem()` when rebooting to bootloader fastboot.
+pub const GBL_EFI_RESET_DATA_BOOTLOADER: &str = "bootloader";
+
+/// `ResetData` reason string (encoded as NUL-terminated UTF-16) passed to
+/// `EFI_RUNTIME_SERVICES.ResetSystem()` when rebooting to userspace fastboot (`fastbootd`).
+pub const GBL_EFI_RESET_DATA_FASTBOOT: &str = "fastboot";
+
+/// `ResetData` reason string (encoded as NUL-terminated UTF-16) passed to
+/// `EFI_RUNTIME_SERVICES.ResetSystem()` when rebooting to recovery.
+pub const GBL_EFI_RESET_DATA_RECOVERY: &str = "recovery";
+
+/// GUID that follows the reason string in GBL `ResetData`, identifying the GBL flags byte after
+/// it.
+pub const GBL_EFI_RESET_DATA_GUID: EfiGuid = EfiGuid::from_u64s(
+    efi_types::GBL_EFI_RESET_DATA_GUID_U64_0,
+    efi_types::GBL_EFI_RESET_DATA_GUID_U64_1,
+);
+
+/// GBL `ResetData` flag: GBL failed to persist the reboot target, so firmware may report it
+/// once via `GetOneShotBootMode()` on the next boot.
+pub const GBL_EFI_RESET_DATA_FLAG_ONE_SHOT: u8 = efi_types::GBL_EFI_RESET_DATA_FLAG_ONE_SHOT as u8;
+
 /// Creates an [EfiEntry] and initializes the EFI global allocator.
 ///
 /// Only the first call initializes the global allocator; subsequent calls (or calls after
@@ -1129,14 +1152,16 @@ impl RuntimeServices {
         &self,
         reset_type: EfiResetType,
         reset_status: EfiStatus,
-        reset_data: Option<&mut [u8]>,
+        reset_data: Option<&[u8]>,
     ) -> Result<Infallible> {
         let (reset_data_len, reset_data_ptr) = match reset_data {
-            Some(v) => (v.len(), v.as_mut_ptr() as _),
+            // `ResetData` is an `IN` parameter per the UEFI spec, which firmware does not modify.
+            Some(v) => (v.len(), v.as_ptr() as _),
             _ => (0, null_mut()),
         };
         // SAFETY:
         // * `reset_data_ptr` is either a valid pointer or NULL which by UEFI spec is allowed.
+        // * `ResetData` is an `IN` parameter per the UEFI spec, so firmware only reads from it.
         // * The call reboots the device and thus is not expected to return.
         unsafe {
             self.runtime_services.reset_system.unwrap()(
