@@ -19,7 +19,7 @@ use crate::{
     gbl_avb::ops::GblAvbOps,
     gbl_println,
     partition::{check_part_unique, split_partition_suffix, Partition, RawName},
-    slots::{Bootability, Slot},
+    slots::{Bootability, Slot, Suffix},
     GblOps,
 };
 use avb::{slot_verify, HashtreeErrorMode, SlotVerifyError, SlotVerifyFlags, VbmetaVerifyError};
@@ -195,6 +195,13 @@ fn format_unlocked(
     yes_no_str(unlocked)
 }
 
+/// Iterates all slots in the order of slot index.
+pub(crate) fn slots_iter<'a>(
+    gbl_ops: &mut impl GblOps<'a>,
+) -> Result<impl Iterator<Item = Result<Slot, Error>> + '_, Error> {
+    Ok((0..gbl_ops.get_slot_count()?).map(|idx| gbl_ops.get_slot_info(idx)))
+}
+
 /// Returns the device slot count, or `Ok(None)` when device slotting is not supported
 /// (`get_slot_count()` returns `Ok(0)`, `Err(Error::Unsupported)`, or `Err(Error::NotFound)`).
 pub(crate) fn slot_count_if_supported<'a>(
@@ -207,11 +214,40 @@ pub(crate) fn slot_count_if_supported<'a>(
     }
 }
 
-/// Iterates all slots in the order of slot index.
-pub(crate) fn slots_iter<'a>(
-    gbl_ops: &mut impl GblOps<'a>,
-) -> Result<impl Iterator<Item = Result<Slot, Error>> + '_, Error> {
-    Ok((0..gbl_ops.get_slot_count()?).map(|idx| gbl_ops.get_slot_info(idx)))
+/// Set of slot suffixes (`'a'..='z'`) reported by [`GblOps`], as a bit mask.
+#[derive(Copy, Clone, Default)]
+pub(crate) struct SlotSuffixMask(u32);
+
+impl SlotSuffixMask {
+    /// Returns the mask bit for `suffix`. [`Suffix`] guarantees `'a'..='z'`, so the shift is in
+    /// `0..26`.
+    fn bit(suffix: Suffix) -> u32 {
+        let c = suffix.as_char();
+        debug_assert!(c.is_ascii_lowercase(), "slot suffix {c:?} is not in 'a'..='z'");
+        1u32 << (u32::from(c) - u32::from('a'))
+    }
+
+    /// Collects the suffixes of all device slots from `gbl_ops`.
+    ///
+    /// Returns `Ok(None)` when device slotting is not supported (see
+    /// [`slot_count_if_supported`]) and propagates `get_slot_info()` errors.
+    pub(crate) fn new<'a>(gbl_ops: &mut impl GblOps<'a>) -> Result<Option<Self>, Error> {
+        let Some(count) = slot_count_if_supported(gbl_ops)? else {
+            return Ok(None);
+        };
+        let mut mask = 0u32;
+        for idx in 0..count {
+            mask |= Self::bit(gbl_ops.get_slot_info(idx)?.suffix);
+        }
+        Ok(Some(Self(mask)))
+    }
+
+    /// Splits `part` into `(base, suffix)` only if `suffix` is a slot suffix on this device.
+    pub(crate) fn split(self, part: &str) -> Option<(&str, char)> {
+        split_partition_suffix(part).filter(|(_, suffix)| {
+            Suffix::from_char(*suffix).is_ok_and(|suffix| self.0 & Self::bit(suffix) != 0)
+        })
+    }
 }
 
 // See definition of [GblFastbootState] for docs on lifetimes and generics parameters.
@@ -760,10 +796,8 @@ where
         gbl_ops: &mut impl GblOps<'a>,
         dynamic_parts: Option<&[RawName]>,
     ) -> Result<Option<&[PartHasSlot]>, Error> {
-        let default_slot = match gbl_ops.get_slot_count() {
-            Ok(0) | Err(Error::Unsupported | Error::NotFound) => return Ok(None),
-            Ok(_) => gbl_ops.get_slot_info(0)?.suffix.as_char(),
-            Err(e) => return Err(e),
+        let Some(slot_suffixes) = SlotSuffixMask::new(gbl_ops)? else {
+            return Ok(None);
         };
 
         let owned_dynamic;
@@ -803,17 +837,14 @@ where
         });
 
         let all_parts = gpt_parts.chain(dynamic_parts.iter().copied());
-        for raw_name in all_parts {
-            let part_name = raw_name.to_str();
-            match split_partition_suffix(part_name) {
+        for raw_part in all_parts {
+            let part_name = raw_part.to_str();
+            match slot_suffixes.split(part_name) {
                 None => match part_has_slot.iter().position(|p| p.0.to_str() == part_name) {
-                    None => part_has_slot.push(PartHasSlot(raw_name, PartHasSlot::NO)),
+                    None => part_has_slot.push(PartHasSlot(raw_part, PartHasSlot::NO)),
                     Some(pos) => part_has_slot[pos].1 = PartHasSlot::NO,
                 },
-                Some((name, suffix))
-                    if suffix == default_slot
-                        && part_has_slot.iter().all(|p| p.0.to_str() != name) =>
-                {
+                Some((name, _)) if part_has_slot.iter().all(|p| p.0.to_str() != name) => {
                     if let Ok(base_name) = name.try_into() {
                         part_has_slot.push(PartHasSlot(base_name, PartHasSlot::YES));
                     }

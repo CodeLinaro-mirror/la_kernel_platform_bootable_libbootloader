@@ -189,6 +189,36 @@ fn current_slot_with_index<'a>(gbl_ops: &mut impl GblOps<'a>) -> Result<Option<(
     Ok(None)
 }
 
+/// Strips the slot suffix from an exactly matched partition `name` if that suffix is a real device
+/// slot suffix, returning the base name; otherwise returns `name` unchanged.
+///
+/// This never fails: explicit slotted names must remain usable for recovery even when the boot
+/// control protocol is unavailable or broken.
+fn strip_device_slot_suffix<'a, 's>(gbl_ops: &mut impl GblOps<'a>, name: &'s str) -> &'s str {
+    // Only consult the device slots when the name has a candidate `_[a-z]` suffix.
+    let Some((lexical_base, _)) = split_partition_suffix(name) else {
+        return name;
+    };
+    match vars::SlotSuffixMask::new(gbl_ops) {
+        Ok(Some(mask)) => match mask.split(name) {
+            Some((base, _)) => base,
+            None => name,
+        },
+        // Without slotting `_[a-z]` is never a slot suffix.
+        Ok(None) => name,
+        // Fall back to the lexical split on a slot query error. `parse_and_get_partition_io`
+        // matches partition attributes against both the base name and the exact name, so neither
+        // form's attributes are bypassed.
+        Err(e) => {
+            gbl_println!(
+                gbl_ops,
+                "Warning: failed to query device slots ({e}); treating `{name}` as slotted"
+            );
+            lexical_base
+        }
+    }
+}
+
 /// Virtual A/B snapshot cancellation action required before executing a partition write task.
 enum SnapshotMergeCancel {
     /// No snapshot merge cancellation is required before scheduling the task.
@@ -730,7 +760,8 @@ where
     ///
     /// A tuple containing:
     ///
-    /// * The base name of the resolved partition without any slot suffix, or `None` for raw disk.
+    /// * The base name of the resolved partition without its device slot suffix (if any), or
+    ///   `None` for raw disk.
     /// * The list of `(block device ID, Partition)` tuples corresponding to this partition.
     ///
     /// # Errors
@@ -747,10 +778,10 @@ where
     ) -> Result<(Option<&'s str>, ArrayVec<(usize, Partition), MAX_IO_PARTS>), Error> {
         match self.find_partition(target, blk_id) {
             // If there is an exact match, use it.
-            Ok(block_id_and_part) => Ok((
-                target.map(|p| split_partition_suffix(p).map(|(base, _)| base).unwrap_or(p)),
-                [block_id_and_part].into_iter().collect(),
-            )),
+            Ok(block_id_and_part) => {
+                let basename = target.map(|name| strip_device_slot_suffix(gbl_ops, name));
+                Ok((basename, [block_id_and_part].into_iter().collect()))
+            }
             // If we didn't match but have a target name, check for slot suffixes.
             Err(Error::PartitionNotFound) if target.is_some() => {
                 let target = target.unwrap();
@@ -869,12 +900,21 @@ where
             match basename {
                 // Named partition access.
                 Some(basename) => {
-                    // Check partition attributes for FDR or critical.
-                    let (fdr, critical) = gbl_ops
-                        .avb_read_partition_attributes()?
-                        .find(|p| p.name.as_str() == basename)
-                        .map(|p| (p.fdr, p.critical))
-                        .unwrap_or((Fdr::No, Critical::No));
+                    // Check partition attributes for FDR or critical. An attribute declared for
+                    // either the resolved base name or the exact requested name is honored.
+                    let (mut fdr, mut critical) = (Fdr::No, Critical::No);
+                    for attr in gbl_ops.avb_read_partition_attributes()? {
+                        let name = attr.name.as_str();
+                        if name != basename && Some(name) != part {
+                            continue;
+                        }
+                        if attr.fdr == Fdr::Yes {
+                            fdr = Fdr::Yes;
+                        }
+                        if attr.critical == Critical::Yes {
+                            critical = Critical::Yes;
+                        }
+                    }
                     if critical == Critical::Yes {
                         self.check_critical_unlocked(gbl_ops)?
                     }
@@ -2841,6 +2881,19 @@ pub(crate) mod test {
     }
 
     #[test]
+    fn test_resolve_slotted_partitions_non_slot_suffix() {
+        let (basename, parts) = resolve_slotted_partition(
+            &[c"protect_f"],
+            Some("protect_f"),
+            None,
+            ResolveMode::CurrentSlot,
+        )
+        .unwrap();
+        assert_eq!(basename, Some("protect_f"));
+        assert_eq!(parts, vec![(0, "protect_f".to_string())]);
+    }
+
+    #[test]
     fn test_resolve_slotted_partitions_ab_expansion() {
         let (basename, parts) = resolve_slotted_partition(
             &[c"vendor_a", c"vendor_b"],
@@ -2995,6 +3048,38 @@ pub(crate) mod test {
             ),
             Err(Error::Other(Some("slot b broken")))
         );
+    }
+
+    #[test]
+    fn test_resolve_slotted_partitions_exact_match_without_slotting() {
+        // Without slotting a trailing `_[a-z]` is never a slot suffix.
+        for slot_count in [Ok(0), Err(Error::Unsupported), Err(Error::NotFound)] {
+            let dl_buffers = Shared::from(vec![Some(vec![0u8; KiB!(128)]); 1]);
+            let mut storage = FakeGblOpsStorage::default();
+            storage.add_raw_device(c"boot_a", vec![0u8; KiB!(4)]);
+            let mut gbl_ops = FakeGblOps::new(&storage);
+            gbl_ops.slot_count = Some(slot_count);
+            let tasks = vec![].into();
+            let parts = gbl_ops.disks();
+            let gbl_fb = GblFastboot::new(
+                &mut gbl_ops,
+                parts,
+                Task::run,
+                &tasks,
+                &dl_buffers,
+                Default::default(),
+            );
+            let (basename, _) = gbl_fb
+                .state
+                .resolve_slotted_partitions(
+                    gbl_fb.gbl_ops,
+                    Some("boot_a"),
+                    None,
+                    ResolveMode::CurrentSlot,
+                )
+                .unwrap();
+            assert_eq!(basename, Some("boot_a"));
+        }
     }
 
     #[test]
@@ -3669,6 +3754,55 @@ pub(crate) mod test {
         check_var_failure(&mut gbl_fb, "has-slot", "bootloader");
     }
 
+    #[test]
+    fn test_fastboot_getvar_has_slot_non_slot_suffix() {
+        let dl_buffers = Shared::from(vec![Some(vec![0u8; KiB!(128)]); 1]);
+        let mut load_buffer = AlignedBuffer::new(MiB!(8), KERNEL_ALIGNMENT);
+        let mut storage = FakeGblOpsStorage::default();
+        storage.add_gpt_device(include_bytes!("../../../libstorage/test/gpt_test_1.bin"));
+        storage.add_raw_device(c"protect_f", [0xaau8; KiB!(4)]);
+        storage.add_raw_device(c"protect_s", [0x55u8; KiB!(4)]);
+        // Present only in the non-default slot.
+        storage.add_raw_device(c"only_b", [0x33u8; KiB!(4)]);
+        let mut gbl_ops = FakeGblOps::new(&storage);
+        // Conflicting platform override must be ignored/filtered because GBL natively owns
+        // `protect_f` as an unslotted partition (`_f` is not in device slots `['a', 'b']`).
+        gbl_ops.custom_fastboot_vars = vec![custom_var_entry(&["has-slot", "protect_f"], "yes")];
+        let tasks = vec![].into();
+        let parts = gbl_ops.disks();
+        let mut gbl_fb = GblFastboot::new(
+            &mut gbl_ops,
+            parts,
+            Task::run,
+            &tasks,
+            &dl_buffers,
+            GblFbData { boot_buffer: load_buffer.as_mut().into(), ..Default::default() },
+        );
+
+        check_var(&mut gbl_fb, "has-slot", "protect_f", "no");
+        check_var(&mut gbl_fb, "has-slot", "protect_s", "no");
+        check_var_failure(&mut gbl_fb, "has-slot", "protect");
+        // Any device slot suffix (not just the default slot) marks a partition as slotted.
+        check_var(&mut gbl_fb, "has-slot", "only", "yes");
+        assert_eq!(
+            gbl_fb.state.resolve_slotted_partitions(
+                gbl_fb.gbl_ops,
+                Some("only"),
+                None,
+                ResolveMode::CurrentSlot
+            ),
+            Err(Error::PartitionSlotMissing('a'))
+        );
+
+        let mut logger = TestVarSender(vec![]);
+        block_on(gbl_fb.get_var_all(&mut logger)).unwrap();
+        assert!(logger.0.iter().any(|v| v == "has-slot:protect_f: no"));
+        assert!(logger.0.iter().any(|v| v == "has-slot:protect_s: no"));
+        assert!(logger.0.iter().any(|v| v == "has-slot:only: yes"));
+        assert!(!logger.0.iter().any(|v| v == "has-slot:protect_f: yes"));
+        assert!(!logger.0.iter().any(|v| v.starts_with("has-slot:protect:")));
+    }
+
     /// Builds an unsigned vbmeta image containing the given `(key, value)` property descriptors
     /// and chained partition descriptors.
     fn make_test_vbmeta_with_props(props: &[(&str, &str)], chained_partitions: &[&str]) -> Vec<u8> {
@@ -4280,24 +4414,33 @@ pub(crate) mod test {
         let dl_buffers = Shared::from(vec![Some(vec![0u8; KiB!(128)]); 1]);
         let mut storage = FakeGblOpsStorage::default();
         storage.add_raw_device(c"critical", INITIAL_CONTENTS);
+        storage.add_raw_device(c"protect_f", INITIAL_CONTENTS);
         let mut gbl_ops = FakeGblOps::new(&storage);
         gbl_ops.avb_device_status.is_unlocked = true;
         gbl_ops.avb_device_status.is_unlockable = true;
         gbl_ops.current_slot = Some(Ok(1));
-        // Mark the "critical" partition as critically-locked.
-        gbl_ops.avb_partition_attributes = Some(Ok(vec![SpecializedPartition {
-            name: PartitionName::try_from("critical").unwrap(),
-            critical: Critical::Yes,
-            ..Default::default()
-        }]));
+        // Mark the "critical" and non-slot-suffixed "protect_f" partitions as critically-locked.
+        gbl_ops.avb_partition_attributes = Some(Ok(vec![
+            SpecializedPartition {
+                name: PartitionName::try_from("critical").unwrap(),
+                critical: Critical::Yes,
+                ..Default::default()
+            },
+            SpecializedPartition {
+                name: PartitionName::try_from("protect_f").unwrap(),
+                critical: Critical::Yes,
+                ..Default::default()
+            },
+        ]));
         let tasks = vec![].into();
         let parts = gbl_ops.disks();
         let boot_buffer = Default::default();
         let mut gbl_fb =
             GblFastboot::new(&mut gbl_ops, parts, Task::run, &tasks, &dl_buffers, boot_buffer);
 
-        // The exact name should be guarded by the critical lock.
+        // The exact names should be guarded by the critical lock.
         assert_eq!(fb_flash(&mut gbl_fb, "critical"), FAIL_MESSAGE_CRITICAL_LOCK);
+        assert_eq!(fb_flash(&mut gbl_fb, "protect_f"), FAIL_MESSAGE_CRITICAL_LOCK);
 
         // Slotted variations do not exist.
         assert_eq!(fb_flash(&mut gbl_fb, "critical_a"), FAIL_MESSAGE_NOT_FOUND);
@@ -4309,11 +4452,99 @@ pub(crate) mod test {
             fetch(&mut gbl_fb, "critical".into(), 0, INITIAL_CONTENTS.len()).unwrap(),
             INITIAL_CONTENTS
         );
+        assert_eq!(
+            fetch(&mut gbl_fb, "protect_f".into(), 0, INITIAL_CONTENTS.len()).unwrap(),
+            INITIAL_CONTENTS
+        );
 
         // Unlock the critical lock, then flashing should work.
         assert_eq!(fb_unlock_critical(&mut gbl_fb), b"OKAY");
 
         check_flash_part(&mut gbl_fb, "critical", &[0x55u8; KiB!(4)]);
+        check_flash_part(&mut gbl_fb, "protect_f", &[0x55u8; KiB!(4)]);
+    }
+
+    /// Builds critically-locked fake ops with attributes `critical` and `protect_f` marked
+    /// `Critical::Yes`.
+    fn critical_lock_test_ops(storage: &FakeGblOpsStorage) -> FakeGblOps<'_> {
+        let mut gbl_ops = FakeGblOps::new(storage);
+        gbl_ops.avb_device_status.is_unlocked = true;
+        gbl_ops.avb_device_status.is_unlockable = true;
+        gbl_ops.avb_partition_attributes = Some(Ok(vec![
+            SpecializedPartition {
+                name: PartitionName::try_from("critical").unwrap(),
+                critical: Critical::Yes,
+                ..Default::default()
+            },
+            SpecializedPartition {
+                name: PartitionName::try_from("protect_f").unwrap(),
+                critical: Critical::Yes,
+                ..Default::default()
+            },
+        ]));
+        gbl_ops
+    }
+
+    #[test]
+    fn test_flash_partition_critical_slot_query_error() {
+        // A slot query error must never bypass the critical lock (neither for a slotted partition
+        // whose attribute uses the base name, nor for an unslotted `_[a-z]` partition whose
+        // attribute uses the full name), while explicit slotted names stay flashable.
+        for (slot_count, slot_infos) in [
+            (Some(Ok(2)), vec![Ok(slot('a')), Err(Error::Other(None))]),
+            (Some(Err(Error::UnsupportedVersion)), vec![Ok(slot('a')), Ok(slot('b'))]),
+        ] {
+            let dl_buffers = Shared::from(vec![Some(vec![0u8; KiB!(128)]); 1]);
+            let mut storage = FakeGblOpsStorage::default();
+            for name in [c"critical_a", c"critical_b", c"protect_f", c"boot_a", c"boot_b"] {
+                storage.add_raw_device(name, [0x11u8; KiB!(4)]);
+            }
+            let mut gbl_ops = critical_lock_test_ops(&storage);
+            gbl_ops.slot_count = slot_count;
+            gbl_ops.slot_infos = slot_infos;
+            let tasks = vec![].into();
+            let parts = gbl_ops.disks();
+            let mut gbl_fb = GblFastboot::new(
+                &mut gbl_ops,
+                parts,
+                Task::run,
+                &tasks,
+                &dl_buffers,
+                Default::default(),
+            );
+
+            assert_eq!(fb_flash(&mut gbl_fb, "critical_a"), FAIL_MESSAGE_CRITICAL_LOCK);
+            assert_eq!(fb_flash(&mut gbl_fb, "protect_f"), FAIL_MESSAGE_CRITICAL_LOCK);
+            check_flash_part(&mut gbl_fb, "boot_a", &[0x55u8; KiB!(4)]);
+        }
+    }
+
+    #[test]
+    fn test_flash_partition_critical_without_slotting() {
+        // Without slotting, attributes are matched by the full partition name only.
+        let dl_buffers = Shared::from(vec![Some(vec![0u8; KiB!(128)]); 1]);
+        let mut storage = FakeGblOpsStorage::default();
+        for name in [c"critical_a", c"critical_b", c"protect_f"] {
+            storage.add_raw_device(name, [0x11u8; KiB!(4)]);
+        }
+        let mut gbl_ops = critical_lock_test_ops(&storage);
+        gbl_ops.slot_count = Some(Err(Error::Unsupported));
+        gbl_ops.current_slot = Some(Err(Error::Unsupported));
+        let tasks = vec![].into();
+        let parts = gbl_ops.disks();
+        let mut gbl_fb = GblFastboot::new(
+            &mut gbl_ops,
+            parts,
+            Task::run,
+            &tasks,
+            &dl_buffers,
+            Default::default(),
+        );
+
+        assert_eq!(fb_flash(&mut gbl_fb, "protect_f"), FAIL_MESSAGE_CRITICAL_LOCK);
+        // `critical` (attribute name) is not a partition, and `critical_a` is not matched by it.
+        assert_eq!(fb_flash(&mut gbl_fb, "critical"), FAIL_MESSAGE_NOT_FOUND);
+        check_flash_part(&mut gbl_fb, "critical_a", &[0x55u8; KiB!(4)]);
     }
 
     // We only allow raw disk writes in dev builds.
