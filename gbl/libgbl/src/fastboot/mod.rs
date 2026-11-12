@@ -95,7 +95,8 @@ use sparse::is_sparse_image;
 
 mod pin_fut_container;
 pub(crate) use pin_fut_container::{
-    AsyncTaskState, PinFutContainerTyped, PinFutSlice, WaitingForAsyncTasksGuard,
+    ActiveTransportGuard, AsyncTaskState, PinFutContainerTyped, PinFutSlice,
+    WaitingForAsyncTasksGuard,
 };
 pub use pin_fut_container::{FutContext, PinFutContainer};
 
@@ -199,10 +200,62 @@ impl Display for DataCommandLog {
     }
 }
 
+/// Writes `data` starting at `base_off` on `io`. When running as a background async task on
+/// synchronous storage while the active transport specifies a synchronous write slice limit, yields
+/// once on initial scheduling and writes at most one slice per `poll_all` pass, draining any
+/// remaining bytes in a single unchunked write if the slice limit is cleared or a foreground wait
+/// begins.
+async fn write_sync_chunked<B: BlockIo, P2: BufferPool>(
+    io: &MultiPartitionIo<'_, B, P2, MAX_IO_PARTS, ReadWrite>,
+    base_off: u64,
+    data: &mut [u8],
+    is_async_task: bool,
+    state: Option<&Shared<AsyncTaskState>>,
+) -> Result<(), Error> {
+    let Some(state) = state.filter(|s| {
+        is_async_task && !io.is_async() && s.borrow().effective_sync_write_slice().is_some()
+    }) else {
+        return io.write(base_off, data).await;
+    };
+    yield_now().await;
+    let mut written = 0;
+    while written < data.len() {
+        let Some(slice_len) = state.borrow().effective_sync_write_slice() else {
+            return io.write(base_off + u64::try_from(written)?, &mut data[written..]).await;
+        };
+        if !state.borrow_mut().take_sync_write_budget() {
+            yield_now().await;
+            continue;
+        }
+        let chunk_len =
+            min(data.len() - written, usize::try_from(slice_len.get()).unwrap_or(usize::MAX));
+        io.write(base_off + u64::try_from(written)?, &mut data[written..written + chunk_len])
+            .await?;
+        written += chunk_len;
+        if written < data.len() {
+            yield_now().await;
+        }
+    }
+    Ok(())
+}
+
 /// Represents the workload of a GBL Fastboot async task.
 enum TaskWorkload<'a, 'b, B: BlockIo, P2: BufferPool, P: BufferPool> {
     /// Image flashing task. (partition io, downloaded data, data size)
     Flash(MultiPartitionIo<'a, B, P2, MAX_IO_PARTS, ReadWrite>, ScopedBuffer<'b, P>, usize),
+    /// Streaming image flashing task (`stream-flash`). (partition io, downloaded data, data size,
+    /// async task state)
+    ///
+    /// Write slicing (`write_sync_chunked`) is intentionally scoped to `StreamFlash` and `Fill`,
+    /// which pipeline back-to-back segments over the transport. Classical `Flash` and
+    /// `FlashSparse` are left unchunked to avoid extra per-call storage overhead on non-streaming
+    /// flashes and storage backends such as eMMC/UFS.
+    StreamFlash(
+        MultiPartitionIo<'a, B, P2, MAX_IO_PARTS, ReadWrite>,
+        ScopedBuffer<'b, P>,
+        usize,
+        Option<&'b Shared<AsyncTaskState>>,
+    ),
     /// Sparse image flashing task. (partition io, downloaded data, data size)
     FlashSparse(MultiPartitionIo<'a, B, P2, MAX_IO_PARTS, ReadWrite>, ScopedBuffer<'b, P>, usize),
     /// Fill a partition range with a 32 bit value. (partition io, buffer pool, value, state)
@@ -219,9 +272,12 @@ enum TaskWorkload<'a, 'b, B: BlockIo, P2: BufferPool, P: BufferPool> {
 
 impl<'a, 'b, B: BlockIo, P2: BufferPool, P: BufferPool> TaskWorkload<'a, 'b, B, P2, P> {
     /// Runs the task and returns the result, task will be reset to None.
-    async fn run(&mut self) -> Result<(), Error> {
+    async fn run(&mut self, is_async_task: bool) -> Result<(), Error> {
         let res = match self {
             Self::Flash(io, data, size) => io.write(0, &mut data[..*size]).await,
+            Self::StreamFlash(io, data, size, state) => {
+                write_sync_chunked(io, 0, &mut data[..*size], is_async_task, *state).await
+            }
             Self::FlashSparse(io, data, size) => io.write_sparse(data, *size).await,
             Self::Fill(io, pool, payload, state) => {
                 // Wait until earlier queued tasks have finished before taking a download buffer
@@ -255,7 +311,8 @@ impl<'a, 'b, B: BlockIo, P2: BufferPool, P: BufferPool> TaskWorkload<'a, 'b, B, 
                     // so the subtraction never overflows.
                     let rem = usize::try_from(io_size - off)?;
                     let write_len = min(buffer.len(), rem);
-                    io.write(off, &mut buffer[..write_len]).await?;
+                    write_sync_chunked(io, off, &mut buffer[..write_len], is_async_task, *state)
+                        .await?;
                 }
                 Ok(())
             }
@@ -356,7 +413,7 @@ impl<'a, 'b, B: BlockIo, P2: BufferPool, P: BufferPool> Task<'a, 'b, B, P2, P> {
 
     /// Runs the task and returns the result.
     async fn run_checked(&mut self) -> Result<(), Error> {
-        self.workload.run().await
+        self.workload.run(false).await
     }
 
     /// Runs the task. Panics on error.
@@ -364,7 +421,7 @@ impl<'a, 'b, B: BlockIo, P2: BufferPool, P: BufferPool> Task<'a, 'b, B, P2, P> {
     /// The method is intended for use in the context of parallel/background async tasks where
     /// errors can't be easily handled by the main routine.
     async fn run(mut self) {
-        if let Err(e) = self.workload.run().await {
+        if let Err(e) = self.workload.run(true).await {
             panic!(
                 "A Fastboot async task failed: {e:?}, context: {}",
                 from_utf8(&self.context[..]).unwrap_or("")
@@ -647,10 +704,10 @@ where
     }
 
     /// Listens on the given transports and TCP channels and runs fastboot.
-    async fn run(
+    async fn run<Tr: GblGenericTransport, Tcp: GblTcpStream>(
         &mut self,
-        transports: &mut [impl GblGenericTransport],
-        mut tcp: Option<impl GblTcpStream>,
+        transports: &mut [Tr],
+        mut tcp: Option<Tcp>,
     ) {
         if transports.is_empty() && tcp.is_none() {
             gbl_println!(self.gbl_ops, "No transports found for GBL Fastboot");
@@ -672,11 +729,20 @@ where
         let cmd_loop_task = &mut pin!(async {
             // Disable tracing by default to avoid having too many polling traces.
             let _guard = TraceGuard::new(false);
+            // For packet-based `GblGenericTransport`s, each command is a separate
+            // `process_next_command()` call and background tasks run across the idle polling
+            // iterations between commands, so the guard is retained across iterations unless a TCP
+            // session takes over. By contrast, `v.run_session()` spans an entire multi-command TCP
+            // session.
+            let mut active_transport_guard = None;
             'outer: loop {
                 for t in transports.iter_mut() {
                     if t.has_packet() {
                         // Enable trace when actually doing useful work.
                         let _guard = TraceGuard::new(trace_config_orig);
+                        active_transport_guard.get_or_insert_with(|| {
+                            ActiveTransportGuard::new(async_task_state, Tr::MAX_SYNC_WRITE_SLICE)
+                        });
                         match process_next_command(t, self).await {
                             Ok(true) => break 'outer,
                             Err(e) => {
@@ -693,7 +759,12 @@ where
                 {
                     // Enable trace when actually doing useful work.
                     let _guard = TraceGuard::new(trace_config_orig);
-                    let res = v.run_session(self).await;
+                    active_transport_guard = None;
+                    let res = {
+                        let _transport_guard =
+                            ActiveTransportGuard::new(async_task_state, Tcp::MAX_SYNC_WRITE_SLICE);
+                        v.run_session(self).await
+                    };
                     self.flush_data_command_log();
                     match res {
                         Ok(()) => break 'outer,
@@ -706,6 +777,7 @@ where
 
                 yield_now().await;
             }
+            drop(active_transport_guard);
             *cmd_loop_end.borrow_mut() = true;
         });
 
@@ -2419,13 +2491,21 @@ where
                         Some(_) => {}
                         None => verify_stream_crc32(&download[..size], checksum).await?,
                     }
-                    Task::new(TaskWorkload::Flash(io, download, size), |f| {
-                        write!(
-                            f,
-                            "stream-flash:{}:{:#x}:{:#x}",
-                            command.partition, command.offset, size
-                        )
-                    })
+                    Task::new(
+                        TaskWorkload::StreamFlash(
+                            io,
+                            download,
+                            size,
+                            self.state.data.async_task_state,
+                        ),
+                        |f| {
+                            write!(
+                                f,
+                                "stream-flash:{}:{:#x}:{:#x}",
+                                command.partition, command.offset, size
+                            )
+                        },
+                    )
                 }
             };
 
@@ -2904,6 +2984,7 @@ pub(crate) mod test {
         ABR_DATA_SIZE,
     };
     use core::{
+        num::NonZeroU64,
         ops::Deref,
         pin::{pin, Pin},
     };
@@ -10460,5 +10541,498 @@ pub(crate) mod test {
             gbl_fb.state.data_command_log.take().is_none(),
             "stream() error path must flush data_command_log before logging the failure"
         );
+    }
+
+    const TEST_SLICE_256K: Option<NonZeroU64> = NonZeroU64::new(KiB!(256) as u64);
+
+    /// Wrapper around [`SharedTestListener`] reporting a 256 KiB `MAX_SYNC_WRITE_SLICE` on both
+    /// [`Transport`] and [`TcpStream`].
+    struct SlicedTestListener<'a, 'b>(&'a SharedTestListener<'b>);
+
+    impl Transport for SlicedTestListener<'_, '_> {
+        const MAX_SYNC_WRITE_SLICE: Option<NonZeroU64> = TEST_SLICE_256K;
+
+        async fn receive(&mut self, out: &mut [u8]) -> fastboot::Result<(usize, usize)> {
+            (&*self.0).receive(out).await
+        }
+
+        async fn send_packet(&mut self, packet: &[u8]) -> fastboot::Result<()> {
+            (&*self.0).send_packet(packet).await
+        }
+    }
+
+    impl GblGenericTransport for SlicedTestListener<'_, '_> {
+        fn has_packet(&mut self) -> bool {
+            (&*self.0).has_packet()
+        }
+    }
+
+    impl TcpStream for SlicedTestListener<'_, '_> {
+        const MAX_SYNC_WRITE_SLICE: Option<NonZeroU64> = TEST_SLICE_256K;
+
+        async fn read(&mut self, out: &mut [u8]) -> fastboot::Result<usize> {
+            (&*self.0).read(out).await
+        }
+
+        async fn write_exact(&mut self, data: &[u8]) -> fastboot::Result<()> {
+            (&*self.0).write_exact(data).await
+        }
+    }
+
+    impl GblTcpStream for SlicedTestListener<'_, '_> {
+        fn accept_new(&mut self) -> bool {
+            (&*self.0).accept_new()
+        }
+    }
+
+    /// Creates a two-partition (`part_0`, `part_1`) 1 MiB RAM storage fixture for sync write
+    /// slicing tests.
+    fn make_two_part_storage() -> FakeGblOpsStorage {
+        let mut storage = FakeGblOpsStorage::default();
+        for name in [c"part_0", c"part_1"] {
+            storage.0.push(
+                TestGblDisk::new_raw(
+                    Disk::new_ram_alloc(512, 512, vec![0u8; MiB!(1)]).unwrap(),
+                    name,
+                )
+                .unwrap(),
+            );
+        }
+        storage
+    }
+
+    #[test]
+    fn test_sync_write_slicing_stream_flash_budget_and_wait_drain() {
+        let storage = make_two_part_storage();
+        let dl_buffers = Shared::from(vec![
+            Some(AlignedBuffer::new(MiB!(1), 512)),
+            Some(AlignedBuffer::new(MiB!(1), 512)),
+        ]);
+        let mut gbl_ops = FakeGblOps::new(&storage);
+        gbl_ops.avb_device_status.is_unlocked = true;
+        let async_task_state = Shared::from(AsyncTaskState::default());
+        let tasks = vec![].into();
+        let parts = gbl_ops.disks();
+        let mut gbl_fb = GblFastboot::new(
+            &mut gbl_ops,
+            parts,
+            Task::run,
+            &tasks,
+            &dl_buffers,
+            GblFbData { async_task_state: Some(&async_task_state), ..Default::default() },
+        );
+        let tasks = gbl_fb.tasks();
+        let resp: TestResponder = Default::default();
+
+        block_on(oem(&mut gbl_fb, "gbl-enable-async-task", &resp)).unwrap();
+        let part0 = storage[0].partition_io(None).unwrap();
+        let part1 = storage[1].partition_io(None).unwrap();
+        let io0 = part0.dev().io();
+        let io1 = part1.dev().io();
+        io0.reset_accesses();
+        io1.reset_accesses();
+
+        // Two queued `StreamFlash` tasks share one 256 KiB sync write budget per `poll_all` pass,
+        // yield once on scheduling, and drain unchunked under `WaitingForAsyncTasksGuard`.
+        let payload0 = vec![0xa5u8; MiB!(1)];
+        let crc0 = crc32fast::hash(&payload0);
+        let payload1 = vec![0x5au8; KiB!(512)];
+        let crc1 = crc32fast::hash(&payload1);
+        let _transport_guard = ActiveTransportGuard::new(Some(&async_task_state), TEST_SLICE_256K);
+        set_download(&mut gbl_fb, &payload0);
+        let cmd0 = format!("stream-flash:part_0:0:{crc0:#x}");
+        block_on(gbl_fb.stream(cmd0.as_str().try_into().unwrap(), &resp)).unwrap();
+        assert_eq!(io0.num_writes(), 0);
+
+        set_download(&mut gbl_fb, &payload1);
+        let cmd1 = format!("stream-flash:part_1:0:{crc1:#x}");
+        block_on(gbl_fb.stream(cmd1.as_str().try_into().unwrap(), &resp)).unwrap();
+        assert_eq!(io0.num_writes(), 1);
+        assert_eq!(io1.num_writes(), 0);
+
+        // Second pass: task #0 writes its second 256 KiB slice; task #1 stays deferred.
+        assert_eq!(tasks.borrow_mut().poll_all(Some(&async_task_state)), 2);
+        assert_eq!(io0.num_writes(), 2);
+        assert_eq!(io1.num_writes(), 0);
+
+        // Entering `WaitingForAsyncTasksGuard` drains remaining bytes unchunked.
+        {
+            let _wait_guard = WaitingForAsyncTasksGuard::new(Some(&async_task_state));
+            assert_eq!(tasks.borrow_mut().poll_all(Some(&async_task_state)), 0);
+        }
+        assert_eq!(io0.num_writes(), 3);
+        assert_eq!(io1.num_writes(), 1);
+        assert_eq!(io0.storage().deref(), payload0.as_slice());
+        assert_eq!(&io1.storage().deref()[..KiB!(512)], payload1.as_slice());
+    }
+
+    #[test]
+    fn test_sync_write_slicing_guard_drop_drains_remaining_write() {
+        let storage = make_two_part_storage();
+        let dl_buffers = Shared::from(vec![Some(AlignedBuffer::new(MiB!(1), 512))]);
+        let mut gbl_ops = FakeGblOps::new(&storage);
+        gbl_ops.avb_device_status.is_unlocked = true;
+        let async_task_state = Shared::from(AsyncTaskState::default());
+        let tasks = vec![].into();
+        let parts = gbl_ops.disks();
+        let mut gbl_fb = GblFastboot::new(
+            &mut gbl_ops,
+            parts,
+            Task::run,
+            &tasks,
+            &dl_buffers,
+            GblFbData { async_task_state: Some(&async_task_state), ..Default::default() },
+        );
+        let tasks = gbl_fb.tasks();
+        let resp: TestResponder = Default::default();
+
+        block_on(oem(&mut gbl_fb, "gbl-enable-async-task", &resp)).unwrap();
+        let part0 = storage[0].partition_io(None).unwrap();
+        let io0 = part0.dev().io();
+        io0.reset_accesses();
+
+        // Dropping `ActiveTransportGuard` mid-task resets `max_sync_write_slice` to `None`, so the
+        // next `poll_all` drains the remaining 768 KiB in a single unchunked write.
+        let payload = vec![0x3cu8; MiB!(1)];
+        let crc = crc32fast::hash(&payload);
+        let transport_guard = ActiveTransportGuard::new(Some(&async_task_state), TEST_SLICE_256K);
+        set_download(&mut gbl_fb, &payload);
+        let cmd = format!("stream-flash:part_0:0:{crc:#x}");
+        block_on(gbl_fb.stream(cmd.as_str().try_into().unwrap(), &resp)).unwrap();
+        assert_eq!(io0.num_writes(), 0);
+
+        assert_eq!(tasks.borrow_mut().poll_all(Some(&async_task_state)), 1);
+        assert_eq!(io0.num_writes(), 1);
+        drop(transport_guard);
+
+        assert_eq!(tasks.borrow_mut().poll_all(Some(&async_task_state)), 0);
+        assert_eq!(io0.num_writes(), 2);
+        assert_eq!(io0.storage().deref(), payload.as_slice());
+    }
+
+    #[test]
+    fn test_sync_write_slicing_fill_yields_and_slices_writes() {
+        let storage = make_two_part_storage();
+        let dl_buffers = Shared::from(vec![Some(AlignedBuffer::new(MiB!(1), 512))]);
+        let mut gbl_ops = FakeGblOps::new(&storage);
+        gbl_ops.avb_device_status.is_unlocked = true;
+        let async_task_state = Shared::from(AsyncTaskState::default());
+        let tasks = vec![].into();
+        let parts = gbl_ops.disks();
+        let mut gbl_fb = GblFastboot::new(
+            &mut gbl_ops,
+            parts,
+            Task::run,
+            &tasks,
+            &dl_buffers,
+            GblFbData { async_task_state: Some(&async_task_state), ..Default::default() },
+        );
+        let tasks = gbl_fb.tasks();
+        let resp: TestResponder = Default::default();
+
+        block_on(oem(&mut gbl_fb, "gbl-enable-async-task", &resp)).unwrap();
+        let part0 = storage[0].partition_io(None).unwrap();
+        let io0 = part0.dev().io();
+        io0.reset_accesses();
+
+        // `Fill` yields once on scheduling and writes one 256 KiB slice per `poll_all` pass.
+        let _transport_guard = ActiveTransportGuard::new(Some(&async_task_state), TEST_SLICE_256K);
+        let fill_cmd = "stream-fill:part_0:0x0:0x100000:0x12345678";
+        block_on(gbl_fb.stream(fill_cmd.try_into().unwrap(), &resp)).unwrap();
+        assert_eq!(io0.num_writes(), 0);
+        for expected_writes in 1..=3 {
+            assert_eq!(tasks.borrow_mut().poll_all(Some(&async_task_state)), 1);
+            assert_eq!(io0.num_writes(), expected_writes);
+        }
+        assert_eq!(tasks.borrow_mut().poll_all(Some(&async_task_state)), 0);
+        assert_eq!(io0.num_writes(), 4);
+        assert_eq!(
+            io0.storage().deref(),
+            vec![0x12345678u32; MiB!(1) / size_of::<u32>()].as_bytes()
+        );
+    }
+
+    #[test]
+    fn test_sliced_transport_and_tcp_slice_stream_flash_and_fill_only() {
+        let sparse_raw = include_bytes!("../../testdata/sparse_test_raw.bin");
+        let sparse = include_bytes!("../../testdata/sparse_test.bin");
+
+        // Measure baseline write count of `sparse_test.bin` on an unsliced transport so we can
+        // verify `FlashSparse` performs the exact same unchunked writes on sliced transports.
+        let expected_sparse_writes = {
+            let mut storage = FakeGblOpsStorage::default();
+            storage.0.push(
+                TestGblDisk::new_raw(
+                    Disk::new_ram_alloc(512, 512, vec![0u8; sparse_raw.len()]).unwrap(),
+                    c"sparse",
+                )
+                .unwrap(),
+            );
+            let dl_buffers =
+                Shared::from(vec![Some(AlignedBuffer::new(sparse.len() + KiB!(8), 512))]);
+            let mut gbl_ops = FakeGblOps::new(&storage);
+            gbl_ops.avb_device_status.is_unlocked = true;
+            let tasks = vec![].into();
+            let parts = gbl_ops.disks();
+            let mut gbl_fb = GblFastboot::new(
+                &mut gbl_ops,
+                parts,
+                Task::run,
+                &tasks,
+                &dl_buffers,
+                Default::default(),
+            );
+            let resp: TestResponder = Default::default();
+            let part = storage[0].partition_io(None).unwrap();
+            let io = part.dev().io();
+            io.reset_accesses();
+            set_download(&mut gbl_fb, sparse);
+            block_on(gbl_fb.flash("sparse", &resp)).unwrap();
+            io.num_writes()
+        };
+
+        // Both a `GblGenericTransport` with `MAX_SYNC_WRITE_SLICE = Some(256 KiB)` (`use_tcp =
+        // false`) and a `TcpStream` with `MAX_SYNC_WRITE_SLICE = Some(256 KiB)` (`use_tcp = true`)
+        // slice sync `StreamFlash` and `Fill` into four 256 KiB writes while leaving `Flash` (1
+        // write) and `FlashSparse` (`expected_sparse_writes`) unchunked.
+        for use_tcp in [false, true] {
+            let mut storage = FakeGblOpsStorage::default();
+            storage.0.push(
+                TestGblDisk::new_raw(
+                    Disk::new_ram_alloc(512, 512, vec![0u8; MiB!(3)]).unwrap(),
+                    c"part",
+                )
+                .unwrap(),
+            );
+            storage.0.push(
+                TestGblDisk::new_raw(
+                    Disk::new_ram_alloc(512, 512, vec![0u8; sparse_raw.len()]).unwrap(),
+                    c"sparse",
+                )
+                .unwrap(),
+            );
+            let buffers = vec![
+                Some(AlignedBuffer::new(MiB!(1), 512)),
+                Some(AlignedBuffer::new(MiB!(1), 512)),
+            ];
+            let mut gbl_ops = FakeGblOps::new(&storage);
+            gbl_ops.avb_device_status.is_unlocked = true;
+            let listener: SharedTestListener = Default::default();
+
+            let enqueue_cmd = |cmd: &[u8]| {
+                if use_tcp {
+                    listener.add_tcp_length_prefixed_input(cmd);
+                } else {
+                    listener.add_transport_input(cmd);
+                }
+            };
+
+            let stream_payload = vec![0x77u8; MiB!(1)];
+            let stream_crc = crc32fast::hash(&stream_payload);
+            let raw_payload = vec![0x88u8; MiB!(1)];
+
+            if use_tcp {
+                listener.add_tcp_input(b"FB01");
+            }
+            // Overlap 1 MiB `stream-flash` (4 slices) with a 1 MiB `download` (for `flash` later),
+            // then overlap 1 MiB `stream-fill` (4 slices) with a second `download`, then run raw
+            // `flash` (1 unchunked write) and `flash:sparse` (`expected_sparse_writes` writes).
+            enqueue_cmd(b"oem gbl-enable-async-task");
+            enqueue_cmd(b"download:0x100000");
+            enqueue_cmd(&stream_payload);
+            enqueue_cmd(format!("stream-flash:part:0:{stream_crc:#x}").as_bytes());
+            enqueue_cmd(b"download:0x100000");
+            enqueue_cmd(&raw_payload);
+            enqueue_cmd(b"oem gbl-sync-tasks");
+            enqueue_cmd(b"stream-fill:part:0x100000:0x100000:0xfeedface");
+            enqueue_cmd(b"download:0x100000");
+            enqueue_cmd(&raw_payload);
+            enqueue_cmd(b"oem gbl-sync-tasks");
+            // `Flash` on a 1 MiB raw image: must run unchunked (1 write).
+            enqueue_cmd(b"download:0x100000");
+            enqueue_cmd(&raw_payload);
+            enqueue_cmd(b"flash:part//200000");
+            enqueue_cmd(b"oem gbl-sync-tasks");
+            // `FlashSparse`: must run unchunked (`expected_sparse_writes`).
+            enqueue_cmd(format!("download:{:#x}", sparse.len()).as_bytes());
+            enqueue_cmd(sparse);
+            enqueue_cmd(b"flash:sparse");
+            enqueue_cmd(b"oem gbl-sync-tasks");
+            enqueue_cmd(b"continue");
+
+            let part = storage[0].partition_io(None).unwrap();
+            let io = part.dev().io();
+            let sparse_part = storage[1].partition_io(None).unwrap();
+            let sparse_io = sparse_part.dev().io();
+            io.reset_accesses();
+            sparse_io.reset_accesses();
+
+            if use_tcp {
+                let empty_transports: &mut [&SharedTestListener] = &mut [];
+                block_on(run_gbl_fastboot_stack::<2>(
+                    &mut gbl_ops,
+                    buffers,
+                    empty_transports,
+                    Some(SlicedTestListener(&listener)),
+                    Default::default(),
+                ));
+            } else {
+                let mut transports = [SlicedTestListener(&listener)];
+                block_on(run_gbl_fastboot_stack::<2>(
+                    &mut gbl_ops,
+                    buffers,
+                    &mut transports,
+                    None::<&SharedTestListener>,
+                    Default::default(),
+                ));
+            }
+
+            // 4 (`StreamFlash`) + 4 (`Fill`) + 1 (`Flash`) = 9 writes on `part`.
+            assert_eq!(io.num_writes(), 9, "use_tcp={use_tcp}");
+            assert_eq!(sparse_io.num_writes(), expected_sparse_writes, "use_tcp={use_tcp}");
+            assert_eq!(&io.storage().deref()[..MiB!(1)], stream_payload.as_slice());
+            assert_eq!(
+                &io.storage().deref()[MiB!(1)..MiB!(2)],
+                vec![0xfeedfaceu32; MiB!(1) / size_of::<u32>()].as_bytes()
+            );
+            assert_eq!(&io.storage().deref()[MiB!(2)..MiB!(3)], raw_payload.as_slice());
+            assert_eq!(sparse_io.storage().deref(), sparse_raw);
+        }
+    }
+
+    #[test]
+    fn test_unsliced_transport_and_async_storage_write_unchunked() {
+        // Default `GblGenericTransport` (`None`) on sync storage AND sliced transport on async
+        // storage (`io.is_async() == true`) both execute 1 unchunked write per command (`3` total).
+        for storage_is_async in [false, true] {
+            let mut storage = FakeGblOpsStorage::default();
+            let mut disk = Disk::new_ram_alloc(512, 512, vec![0u8; MiB!(3)]).unwrap();
+            disk.io_mut().set_async(storage_is_async);
+            storage.0.push(TestGblDisk::new_raw(disk, c"part").unwrap());
+            let buffers = vec![
+                Some(AlignedBuffer::new(MiB!(1), 512)),
+                Some(AlignedBuffer::new(MiB!(1), 512)),
+            ];
+            let mut gbl_ops = FakeGblOps::new(&storage);
+            gbl_ops.avb_device_status.is_unlocked = true;
+            let listener: SharedTestListener = Default::default();
+
+            let flash_payload = vec![0x55u8; MiB!(1)];
+            let crc = crc32fast::hash(&flash_payload);
+            let raw_payload = vec![0x66u8; MiB!(1)];
+
+            listener.add_transport_input(b"oem gbl-enable-async-task");
+            listener.add_transport_input(b"download:0x100000");
+            listener.add_transport_input(&flash_payload);
+            listener.add_transport_input(format!("stream-flash:part:0:{crc:#x}").as_bytes());
+            listener.add_transport_input(b"download:0x100000");
+            listener.add_transport_input(&raw_payload);
+            listener.add_transport_input(b"oem gbl-sync-tasks");
+            listener.add_transport_input(b"stream-fill:part:0x100000:0x100000:0x89abcdef");
+            listener.add_transport_input(b"download:0x100000");
+            listener.add_transport_input(&raw_payload);
+            listener.add_transport_input(b"oem gbl-sync-tasks");
+            listener.add_transport_input(b"flash:part//200000");
+            listener.add_transport_input(b"oem gbl-sync-tasks");
+            listener.add_transport_input(b"continue");
+
+            let part = storage[0].partition_io(None).unwrap();
+            let io = part.dev().io();
+            io.reset_accesses();
+            if storage_is_async {
+                let mut transports = [SlicedTestListener(&listener)];
+                block_on(run_gbl_fastboot_stack::<2>(
+                    &mut gbl_ops,
+                    buffers,
+                    &mut transports,
+                    None::<&SharedTestListener>,
+                    Default::default(),
+                ));
+            } else {
+                let mut transports = [&listener];
+                block_on(run_gbl_fastboot_stack::<2>(
+                    &mut gbl_ops,
+                    buffers,
+                    &mut transports,
+                    None::<&SharedTestListener>,
+                    Default::default(),
+                ));
+            }
+            assert_eq!(io.num_writes(), 3, "storage_is_async={storage_is_async}");
+            assert_eq!(&io.storage().deref()[..MiB!(1)], flash_payload.as_slice());
+            assert_eq!(
+                &io.storage().deref()[MiB!(1)..MiB!(2)],
+                vec![0x89abcdefu32; MiB!(1) / size_of::<u32>()].as_bytes()
+            );
+            assert_eq!(&io.storage().deref()[MiB!(2)..MiB!(3)], raw_payload.as_slice());
+        }
+    }
+
+    #[test]
+    fn test_active_transport_guard_restores_unsliced_on_switch() {
+        let payload = vec![0x99u8; MiB!(1)];
+        let crc = crc32fast::hash(&payload);
+
+        // Verify that disconnecting from a sliced `TcpStream` (`Some(256 KiB)`) drops its
+        // `ActiveTransportGuard`, so continuing on an unsliced `GblGenericTransport` (`None`)
+        // executes an unchunked write.
+        let mut storage = FakeGblOpsStorage::default();
+        storage.0.push(
+            TestGblDisk::new_raw(
+                Disk::new_ram_alloc(512, 512, vec![0u8; MiB!(2)]).unwrap(),
+                c"part",
+            )
+            .unwrap(),
+        );
+        let buffers =
+            vec![Some(AlignedBuffer::new(MiB!(1), 512)), Some(AlignedBuffer::new(MiB!(1), 512))];
+        let mut gbl_ops = FakeGblOps::new(&storage);
+        gbl_ops.avb_device_status.is_unlocked = true;
+        let sliced_tcp: SharedTestListener = Default::default();
+        let unsliced_transport: SharedTestListener = Default::default();
+
+        sliced_tcp.add_tcp_input(b"FB01");
+        sliced_tcp.add_tcp_length_prefixed_input(b"oem gbl-enable-async-task");
+        sliced_tcp.add_tcp_length_prefixed_input(b"download:0x100000");
+        sliced_tcp.add_tcp_length_prefixed_input(&payload);
+        sliced_tcp
+            .add_tcp_length_prefixed_input(format!("stream-flash:part:0:{crc:#x}").as_bytes());
+        sliced_tcp.add_tcp_length_prefixed_input(b"download:0x100000");
+        sliced_tcp.add_tcp_length_prefixed_input(&payload);
+        sliced_tcp.add_tcp_length_prefixed_input(b"oem gbl-sync-tasks");
+
+        let part = storage[0].partition_io(None).unwrap();
+        let io = part.dev().io();
+        io.reset_accesses();
+        let mut transports = [&unsliced_transport];
+        let mut fb_fut = pin!(run_gbl_fastboot_stack::<2>(
+            &mut gbl_ops,
+            buffers,
+            &mut transports,
+            Some(SlicedTestListener(&sliced_tcp)),
+            Default::default(),
+        ));
+        // Poll until all queued TCP input is consumed and all 4 sliced writes complete, then poll
+        // once more so `run_session()` observes EOF and drops its `ActiveTransportGuard`.
+        let mut polls = 0;
+        while !sliced_tcp.lock().tcp_in_queue.is_empty() || io.num_writes() < 4 {
+            assert!(poll(&mut fb_fut).is_none());
+            polls += 1;
+            assert!(polls < 1000, "TCP session did not finish within expected poll bound");
+        }
+        assert!(poll(&mut fb_fut).is_none());
+        assert_eq!(io.num_writes(), 4);
+
+        io.reset_accesses();
+        unsliced_transport.add_transport_input(b"download:0x100000");
+        unsliced_transport.add_transport_input(&payload);
+        unsliced_transport
+            .add_transport_input(format!("stream-flash:part:0x100000:{crc:#x}").as_bytes());
+        unsliced_transport.add_transport_input(b"download:0x100000");
+        unsliced_transport.add_transport_input(&payload);
+        unsliced_transport.add_transport_input(b"oem gbl-sync-tasks");
+        unsliced_transport.add_transport_input(b"continue");
+        block_on(fb_fut);
+        assert_eq!(io.num_writes(), 1);
     }
 }

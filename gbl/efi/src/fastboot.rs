@@ -45,7 +45,7 @@ const FASTBOOT_TRANSPORTS_MAX: usize = 8;
 #[cfg(feature = "gbl_dev")]
 mod network_fastboot {
     use crate::net::EfiTcpSocket;
-    use core::time::Duration;
+    use core::{num::NonZeroU64, time::Duration};
     use efi::efi_println;
     use libgbl::fastboot::{GblTcpStream, TcpStream};
 
@@ -54,6 +54,9 @@ mod network_fastboot {
 
     const FASTBOOT_TCP_PORT: u16 = 5554;
     const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+    /// Maximum synchronous storage write size per poll pass while a TCP session is active, bounding
+    /// single-threaded UEFI `BlockIo` stalls so `smoltcp` keeps draining incoming RX packets.
+    const TCP_MAX_SYNC_WRITE_SLICE: NonZeroU64 = NonZeroU64::new(256 * 1024).unwrap();
 
     #[derive(PartialEq)]
     /// Represents the connection state resolution done by previous `accept_new` call.
@@ -87,6 +90,8 @@ mod network_fastboot {
         async fn write_exact(&mut self, data: &[u8]) -> fastboot::Result<()> {
             Ok(self.socket.send_exact(data, DEFAULT_TIMEOUT).await?)
         }
+
+        const MAX_SYNC_WRITE_SLICE: Option<NonZeroU64> = Some(TCP_MAX_SYNC_WRITE_SLICE);
     }
 
     impl GblTcpStream for EfiFastbootTcpTransport<'_, '_, '_> {

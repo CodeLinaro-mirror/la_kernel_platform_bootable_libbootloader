@@ -75,6 +75,7 @@ use core::{
     ffi::CStr,
     fmt::{Debug, Display, Formatter, Write},
     mem::size_of,
+    num::NonZeroU64,
     str::{from_utf8, Split},
 };
 use libutils::{next_arg, FormattedBytes, FromHexStr};
@@ -165,6 +166,11 @@ pub trait Transport {
     /// The method assumes `packet` is sent or at least copied to queue after it returns, where
     /// the buffer can go out of scope without affecting anything.
     async fn send_packet(&mut self, packet: &[u8]) -> Result<()>;
+
+    /// Maximum size in bytes of a single synchronous storage write while servicing this
+    /// transport concurrently with background async tasks, or `None` if synchronous writes do
+    /// not need to be sliced.
+    const MAX_SYNC_WRITE_SLICE: Option<NonZeroU64> = None;
 }
 
 /// For now, we hardcode the expected version, until we need to distinguish between multiple
@@ -216,6 +222,11 @@ pub trait TcpStream {
 
     /// Sends exactly `data.len()` number bytes from `data` to the TCP connection.
     async fn write_exact(&mut self, data: &[u8]) -> Result<()>;
+
+    /// Maximum size in bytes of a single synchronous storage write while servicing this stream
+    /// concurrently with background async tasks, or `None` if synchronous writes do not need to
+    /// be sliced.
+    const MAX_SYNC_WRITE_SLICE: Option<NonZeroU64> = None;
 
     /// Runs a fastboot over TCP session.
     ///

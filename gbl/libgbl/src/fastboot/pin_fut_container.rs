@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use core::{future::Future, pin::Pin};
+use core::{future::Future, mem::replace, num::NonZeroU64, pin::Pin};
 use gbl_async::poll_with_local_trace_config;
 use libgblutils::shared::Shared;
 
@@ -21,11 +21,18 @@ use libgblutils::shared::Shared;
 pub(crate) struct AsyncTaskState {
     is_head_task: bool,
     waiting_for_tasks: usize,
+    sync_write_budget: bool,
+    max_sync_write_slice: Option<NonZeroU64>,
 }
 
 impl Default for AsyncTaskState {
     fn default() -> Self {
-        Self { is_head_task: true, waiting_for_tasks: 0 }
+        Self {
+            is_head_task: true,
+            waiting_for_tasks: 0,
+            sync_write_budget: true,
+            max_sync_write_slice: None,
+        }
     }
 }
 
@@ -36,6 +43,20 @@ impl AsyncTaskState {
         self.is_head_task
     }
 
+    /// Returns the active synchronous write slice limit when the active transport specifies one and
+    /// the foreground loop is not blocked waiting for background tasks to finish.
+    pub(crate) fn effective_sync_write_slice(&self) -> Option<NonZeroU64> {
+        self.max_sync_write_slice.filter(|_| self.waiting_for_tasks == 0)
+    }
+
+    /// Claims the single synchronous write slice budget for the current `poll_all` pass.
+    ///
+    /// Replenished at the start of each `poll_all` invocation (`gbl_fb_tasks` and the single
+    /// post-enqueue poll in `schedule_task` after a command's download has already been drained).
+    pub(crate) fn take_sync_write_budget(&mut self) -> bool {
+        replace(&mut self.sync_write_budget, false)
+    }
+
     #[cfg(test)]
     pub(crate) fn is_waiting_for_tasks(&self) -> bool {
         self.waiting_for_tasks > 0
@@ -43,7 +64,7 @@ impl AsyncTaskState {
 }
 
 /// RAII guard marking that the foreground fastboot session is blocked waiting on background async
-/// tasks.
+/// tasks, allowing synchronous storage backends to drain remaining writes without slicing.
 #[must_use]
 pub(crate) struct WaitingForAsyncTasksGuard<'a>(Option<&'a Shared<AsyncTaskState>>);
 
@@ -65,6 +86,33 @@ impl Drop for WaitingForAsyncTasksGuard<'_> {
     }
 }
 
+/// RAII guard configuring the active transport's synchronous write slice limit on
+/// [`AsyncTaskState`] while commands or sessions on that transport are processed, clearing the
+/// limit on drop (guards are not nested).
+#[must_use]
+pub(crate) struct ActiveTransportGuard<'a>(Option<&'a Shared<AsyncTaskState>>);
+
+impl<'a> ActiveTransportGuard<'a> {
+    /// Sets `max_sync_write_slice` for the lifetime of the guard when `state` is `Some`.
+    pub(crate) fn new(
+        state: Option<&'a Shared<AsyncTaskState>>,
+        max_sync_write_slice: Option<NonZeroU64>,
+    ) -> Self {
+        if let Some(s) = state {
+            s.borrow_mut().max_sync_write_slice = max_sync_write_slice;
+        }
+        Self(state)
+    }
+}
+
+impl Drop for ActiveTransportGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(s) = self.0 {
+            s.borrow_mut().max_sync_write_slice = None;
+        }
+    }
+}
+
 #[must_use]
 struct PollPassGuard<'a> {
     state: Option<&'a Shared<AsyncTaskState>>,
@@ -73,7 +121,14 @@ struct PollPassGuard<'a> {
 
 impl<'a> PollPassGuard<'a> {
     fn new(state: Option<&'a Shared<AsyncTaskState>>) -> Self {
-        let prev_is_head_task = state.is_none_or(|s| s.borrow().is_head_task);
+        let prev_is_head_task = if let Some(s) = state {
+            let mut s = s.borrow_mut();
+            let prev = s.is_head_task;
+            s.sync_write_budget = true;
+            prev
+        } else {
+            true
+        };
         Self { state, prev_is_head_task }
     }
 
@@ -271,5 +326,20 @@ mod test {
         );
         assert_eq!(*log.borrow(), vec![(0, true), (1, false), (0, true), (1, true), (1, true)]);
         assert!(state.borrow().is_head_task());
+
+        // `ActiveTransportGuard` configures `effective_sync_write_slice` (suppressed during
+        // foreground waits) and clears the slice limit on drop.
+        let slice_4k = NonZeroU64::new(4096);
+        assert_eq!(state.borrow().effective_sync_write_slice(), None);
+        {
+            let _guard = ActiveTransportGuard::new(Some(&state), slice_4k);
+            assert_eq!(state.borrow().effective_sync_write_slice(), slice_4k);
+            {
+                let _wait = WaitingForAsyncTasksGuard::new(Some(&state));
+                assert_eq!(state.borrow().effective_sync_write_slice(), None);
+            }
+            assert_eq!(state.borrow().effective_sync_write_slice(), slice_4k);
+        }
+        assert_eq!(state.borrow().effective_sync_write_slice(), None);
     }
 }
