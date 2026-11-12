@@ -267,7 +267,7 @@ where
             PartitionTable::Raw(name, size) if name.to_str() == part => {
                 Ok(Partition::Raw(*name, *size))
             }
-            _ => Err(Error::NotFound),
+            _ => Err(Error::PartitionNotFound),
         }
     }
 
@@ -549,7 +549,7 @@ pub fn check_part_unique(
     match (filtered.next(), filtered.next()) {
         (Some(v), None) => Ok(v),
         (Some(_), Some(_)) => Err(Error::NotUnique),
-        _ => Err(Error::NotFound),
+        _ => Err(Error::PartitionNotFound),
     }
 }
 

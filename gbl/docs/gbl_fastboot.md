@@ -61,6 +61,17 @@ implemented by GBL. Firmware should report them via
 [`GBL_EFI_FASTBOOT_PROTOCOL`][gbl_efi_fastboot_protocol] `GetVar()` and
 `GetVarAll()`.
 
+For virtual partitions not managed by GBL (for example, packed firmware images
+that do not exist as GPT or raw block partitions, and, for `has-slot`, are not
+dynamic partitions inside `super`), firmware may also report `has-slot`,
+`partition-size`, `partition-type`, `partition-guid`, and `partition-start` via
+`GetVar()` and `GetVarAll()`. Because GBL currently implements `partition-*`
+only for GPT and raw block partitions, firmware may also supply `partition-*`
+for dynamic partitions inside `super`. Partitions managed by GBL always take
+precedence and cannot be overridden by firmware. When device slotting is
+unsupported, GBL answers `no` for every `has-slot` query without consulting
+firmware.
+
 ## The Partition Argument
 
 Fastboot commands such as `fastboot flash`, `fastboot fetch` and

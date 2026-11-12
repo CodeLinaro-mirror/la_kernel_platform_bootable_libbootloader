@@ -744,7 +744,7 @@ impl<B: DerefMut<Target = [u8]>> Gpt<B> {
     ///
     /// * `part`: Name of the partition.
     pub fn find_partition(&self, part: &str) -> Result<Partition> {
-        self.entries()?.find(|e| e.name() == Some(part)).ok_or(Error::NotFound)
+        self.entries()?.find(|e| e.name() == Some(part)).ok_or(Error::PartitionNotFound)
     }
 
     /// Checks whether the Gpt has been initialized and returns the block size.

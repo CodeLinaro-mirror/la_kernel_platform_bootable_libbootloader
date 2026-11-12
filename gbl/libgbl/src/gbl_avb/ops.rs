@@ -295,7 +295,7 @@ fn split_slotted(partition: &str) -> Result<(&str, SlotIndex), Error> {
 /// Helper for mapping disk read error to IoError.
 fn map_read_err(err: Error) -> IoError {
     match err {
-        Error::NotFound => IoError::NoSuchPartition,
+        Error::PartitionNotFound => IoError::NoSuchPartition,
         Error::ArithmeticOverflow(_) => IoError::RangeOutsidePartition,
         _ => IoError::Io,
     }
