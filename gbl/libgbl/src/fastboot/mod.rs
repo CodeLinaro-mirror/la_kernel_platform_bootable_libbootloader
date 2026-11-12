@@ -94,10 +94,10 @@ pub(crate) mod sparse;
 use sparse::is_sparse_image;
 
 mod pin_fut_container;
-use pin_fut_container::{is_head_task, PinFutContainerTyped, PinFutSlice};
-pub use pin_fut_container::{
-    is_waiting_for_async_tasks, FutContext, PinFutContainer, WaitingForAsyncTasksGuard,
+pub(crate) use pin_fut_container::{
+    AsyncTaskState, PinFutContainerTyped, PinFutSlice, WaitingForAsyncTasksGuard,
 };
+pub use pin_fut_container::{FutContext, PinFutContainer};
 
 // Re-exports dependency types
 pub use fastboot::{TcpStream, Transport};
@@ -205,8 +205,13 @@ enum TaskWorkload<'a, 'b, B: BlockIo, P2: BufferPool, P: BufferPool> {
     Flash(MultiPartitionIo<'a, B, P2, MAX_IO_PARTS, ReadWrite>, ScopedBuffer<'b, P>, usize),
     /// Sparse image flashing task. (partition io, downloaded data, data size)
     FlashSparse(MultiPartitionIo<'a, B, P2, MAX_IO_PARTS, ReadWrite>, ScopedBuffer<'b, P>, usize),
-    /// Fill a partition range with a 32 bit value. (partition io, buffer pool, value)
-    Fill(MultiPartitionIo<'a, B, P2, MAX_IO_PARTS, ReadWrite>, &'b Shared<P>, u32),
+    /// Fill a partition range with a 32 bit value. (partition io, buffer pool, value, state)
+    Fill(
+        MultiPartitionIo<'a, B, P2, MAX_IO_PARTS, ReadWrite>,
+        &'b Shared<P>,
+        u32,
+        Option<&'b Shared<AsyncTaskState>>,
+    ),
     /// Image erase task.
     Erase(MultiPartitionIo<'a, B, P2, MAX_IO_PARTS, ReadWrite>, ScopedBuffer<'b, P>),
     None,
@@ -218,11 +223,11 @@ impl<'a, 'b, B: BlockIo, P2: BufferPool, P: BufferPool> TaskWorkload<'a, 'b, B, 
         let res = match self {
             Self::Flash(io, data, size) => io.write(0, &mut data[..*size]).await,
             Self::FlashSparse(io, data, size) => io.write_sparse(data, *size).await,
-            Self::Fill(io, pool, payload) => {
+            Self::Fill(io, pool, payload, state) => {
                 // Wait until earlier queued tasks have finished before taking a download buffer
                 // from `pool` so a `stream-fill` queued behind a `stream-flash` leaves the second
                 // pool buffer free for the next concurrent `download`.
-                while !is_head_task() {
+                while !state.is_none_or(|s| s.borrow().is_head_task()) {
                     yield_now().await;
                 }
                 let mut buffer =
@@ -480,6 +485,7 @@ enum StageDataType {
 pub(crate) struct GblFbData<'a> {
     pub(crate) boot_buffer: BootBuffer<'a>,
     pub(crate) load_result: Option<Result<LoadedImages<'a>, &'a IntegrationError>>,
+    pub(crate) async_task_state: Option<&'a Shared<AsyncTaskState>>,
 }
 
 /// Enum indicating how to resolve a fastboot partition name.
@@ -651,6 +657,7 @@ where
             return;
         }
         let tasks = self.tasks();
+        let async_task_state = self.state.data.async_task_state;
         // The fastboot command loop task for interacting with the remote host.
         let cmd_loop_end = Shared::from(false);
         let trace_config_orig = gbl_trace_get_enable();
@@ -707,7 +714,7 @@ where
             // Disable tracing for the poll loop. async tasks polled by poll_all() have their local
             // trace config.
             let _guard = TraceGuard::new(false);
-            while tasks.borrow_mut().poll_all() > 0 || !*cmd_loop_end.borrow_mut() {
+            while tasks.borrow_mut().poll_all(async_task_state) > 0 || !*cmd_loop_end.borrow_mut() {
                 yield_now().await;
             }
         });
@@ -1197,14 +1204,14 @@ where
             // added, it must not be evaluated.
             self.tasks.borrow_mut().add_with(|| (self.task_mapper)(take(task)));
             if !task.is_none() {
-                let _wait_guard = WaitingForAsyncTasksGuard::new();
+                let _wait_guard = WaitingForAsyncTasksGuard::new(self.data.async_task_state);
                 while !task.is_none() {
                     yield_now().await;
                     self.tasks.borrow_mut().add_with(|| (self.task_mapper)(take(task)));
                 }
             }
 
-            self.tasks.borrow_mut().poll_all();
+            self.tasks.borrow_mut().poll_all(self.data.async_task_state);
             if !self.async_info_sent {
                 let info = "Launched async task. Run \"oem gbl-sync-tasks\" to sync.";
                 responder.send_info(info).await?;
@@ -1235,10 +1242,11 @@ where
         responder: &mut impl InfoSender,
         tag: &str,
     ) {
+        let async_task_state = self.data.async_task_state;
         let mut num_tasks = 0;
         let mut wait_guard = None;
         loop {
-            let new_num_tasks = self.tasks.borrow_mut().poll_all();
+            let new_num_tasks = self.tasks.borrow_mut().poll_all(async_task_state);
             if new_num_tasks == 0 {
                 self.pending_misc_task = false;
                 break;
@@ -1259,7 +1267,7 @@ where
             // Once the initial INFO status has been sent, no bulk download is active until all
             // tasks finish, so allow synchronous storage backends to drain remaining writes at full
             // unchunked speed.
-            wait_guard.get_or_insert_with(WaitingForAsyncTasksGuard::new);
+            wait_guard.get_or_insert_with(|| WaitingForAsyncTasksGuard::new(async_task_state));
             yield_now().await;
         }
     }
@@ -1316,7 +1324,8 @@ where
     /// Drains background fastboot tasks if a pending background task could modify `misc`.
     async fn wait_pending_misc_task(&mut self) {
         if self.pending_misc_task {
-            while self.tasks.borrow_mut().poll_all() > 0 {
+            let _wait_guard = WaitingForAsyncTasksGuard::new(self.data.async_task_state);
+            while self.tasks.borrow_mut().poll_all(self.data.async_task_state) > 0 {
                 yield_now().await;
             }
             self.pending_misc_task = false;
@@ -1331,10 +1340,11 @@ where
     ) -> Result<MiscVirtualAbMessage, Error> {
         self.wait_pending_misc_task().await;
         let tasks = self.tasks;
+        let async_task_state = self.data.async_task_state;
         select(read_virtual_ab_message(gbl_ops), async {
             loop {
                 yield_now().await;
-                tasks.borrow_mut().poll_all();
+                tasks.borrow_mut().poll_all(async_task_state);
             }
         })
         .await
@@ -1411,10 +1421,11 @@ where
             msg.set_merge_status(MergeStatus::Cancelled);
             self.wait_pending_misc_task().await;
             let tasks = self.tasks;
+            let async_task_state = self.data.async_task_state;
             select(write_virtual_ab_message(gbl_ops, msg), async {
                 loop {
                     yield_now().await;
-                    tasks.borrow_mut().poll_all();
+                    tasks.borrow_mut().poll_all(async_task_state);
                 }
             })
             .await
@@ -1794,7 +1805,7 @@ where
         } else if let Some(buf) = self.buffer_pool.allocate() {
             buf
         } else {
-            let _wait_guard = WaitingForAsyncTasksGuard::new();
+            let _wait_guard = WaitingForAsyncTasksGuard::new(self.data.async_task_state);
             self.buffer_pool.allocate_async().await
         }
     }
@@ -1807,7 +1818,7 @@ where
         } else if let Some(buf) = self.buffer_pool.allocate() {
             current.insert(buf)
         } else {
-            let _wait_guard = WaitingForAsyncTasksGuard::new();
+            let _wait_guard = WaitingForAsyncTasksGuard::new(self.data.async_task_state);
             current.insert(self.buffer_pool.allocate_async().await)
         }
     }
@@ -2378,13 +2389,21 @@ where
                     self.state.current_download_buffer = None;
                     self.state.current_download_size = 0;
                     self.state.current_download_crc = None;
-                    Task::new(TaskWorkload::Fill(io, self.state.buffer_pool, payload), |f| {
-                        write!(
-                            f,
-                            "stream-fill:{}:{:#x}:{:#x}",
-                            command.partition, command.offset, size
-                        )
-                    })
+                    Task::new(
+                        TaskWorkload::Fill(
+                            io,
+                            self.state.buffer_pool,
+                            payload,
+                            self.state.data.async_task_state,
+                        ),
+                        |f| {
+                            write!(
+                                f,
+                                "stream-fill:{}:{:#x}:{:#x}",
+                                command.partition, command.offset, size
+                            )
+                        },
+                    )
                 }
                 StreamOperation::Flash { checksum } => {
                     let (download, size, crc) =
@@ -2768,6 +2787,11 @@ pub(crate) async fn run_gbl_fastboot_stack<'a, const N: usize>(
     data: GblFbData<'_>,
 ) -> GblFastbootResult {
     let buffer_pool = buffer_pool.into();
+    let async_task_state = Shared::from(AsyncTaskState::default());
+    let data = GblFbData {
+        async_task_state: Some(data.async_task_state.unwrap_or(&async_task_state)),
+        ..data
+    };
     // Creates N worker tasks.
     let mut tasks: [_; N] = from_fn(|_| Task::default().run());
     // It is possible to avoid the use of the unsafe `Pin::new_unchecked` by delaring the array and
@@ -10282,6 +10306,7 @@ pub(crate) mod test {
         let dl_buffers = Shared::from(vec![Some(vec![0u8; KiB!(2)]); 2]);
         let mut gbl_ops = FakeGblOps::new(&storage);
         gbl_ops.avb_device_status.is_unlocked = true;
+        let async_task_state = Shared::from(AsyncTaskState::default());
         let tasks = vec![].into();
         let parts = gbl_ops.disks();
         let mut gbl_fb = GblFastboot::new(
@@ -10290,7 +10315,7 @@ pub(crate) mod test {
             Task::run,
             &tasks,
             &dl_buffers,
-            Default::default(),
+            GblFbData { async_task_state: Some(&async_task_state), ..Default::default() },
         );
         let tasks = gbl_fb.tasks();
         let resp: TestResponder = Default::default();
@@ -10324,7 +10349,7 @@ pub(crate) mod test {
             );
         }
 
-        tasks.borrow_mut().run();
+        tasks.borrow_mut().run_with_state(&async_task_state);
         assert_eq!(fetch(&mut gbl_fb, "boot_a".into(), 0, KiB!(2)).unwrap(), chunk1);
         assert_eq!(
             fetch(&mut gbl_fb, "boot_a".into(), KiB!(2), KiB!(2)).unwrap(),

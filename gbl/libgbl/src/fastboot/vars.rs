@@ -484,6 +484,7 @@ where
 
         // Gets platform specific variables
         let tasks = self.tasks;
+        let async_task_state = self.data.async_task_state;
         let _ = gbl_ops.fastboot_visit_all_variables(|ops, args, val| {
             if let Some((first, rest_args)) = args.split_first_chunk::<1>() {
                 // Needs to split ':' because the interface allows backend to pass ':' concatenated
@@ -495,7 +496,7 @@ where
                     self.get_var_native(ops, var, split_args, Some(&dynamic_parts), true, &mut buf),
                     async {
                         loop {
-                            tasks.borrow_mut().poll_all();
+                            tasks.borrow_mut().poll_all(async_task_state);
                             yield_now().await;
                         }
                     },
@@ -519,7 +520,7 @@ where
                 // running in the context of backend.
                 let _ = block_on(select(send.send_var_info(name, args, val), async {
                     loop {
-                        tasks.borrow_mut().poll_all();
+                        tasks.borrow_mut().poll_all(async_task_state);
                         yield_now().await;
                     }
                 }))
@@ -538,7 +539,7 @@ where
         } else if let Some(buf) = self.buffer_pool.allocate() {
             buf.len()
         } else {
-            let _wait_guard = super::WaitingForAsyncTasksGuard::new();
+            let _wait_guard = super::WaitingForAsyncTasksGuard::new(self.data.async_task_state);
             self.buffer_pool.allocate_async().await.len()
         }
     }
@@ -1015,8 +1016,11 @@ where
         let ab_suffix = CStr::from_bytes_with_nul(ab_suffix_str.as_bytes())
             .map_err(|_| "Invalid slot suffix")?;
         // Wait for any pending async I/O tasks to finish before reading vbmeta from disk.
-        while self.tasks.borrow_mut().poll_all() > 0 {
-            yield_now().await;
+        {
+            let _wait_guard = super::WaitingForAsyncTasksGuard::new(self.data.async_task_state);
+            while self.tasks.borrow_mut().poll_all(self.data.async_task_state) > 0 {
+                yield_now().await;
+            }
         }
         let mut avb_ops = GblAvbOps::new(gbl_ops, None, &mut [], false);
         // Allow verification errors regardless of lock state so `fastboot getvar` can still

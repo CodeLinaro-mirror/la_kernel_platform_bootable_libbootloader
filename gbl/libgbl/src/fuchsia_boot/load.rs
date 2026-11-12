@@ -15,7 +15,7 @@
 use crate::{
     android_boot::GblFastbootEntry,
     constants::{PAGE_SIZE, ZIRCON_KERNEL_ALIGNMENT},
-    fastboot::LoadedImageInfo,
+    fastboot::{AsyncTaskState, LoadedImageInfo},
     fuchsia_boot::{
         fixup_zbi_items, read_zircon_image, vboot::zircon_verify_kernel_in_place,
         zbi_split_unused_buffer_mut, zircon_check_boot_mode, zircon_part_name, GblAbrOps,
@@ -24,7 +24,7 @@ use crate::{
 };
 pub use abr::{get_boot_slot, SlotIndex};
 use liberror::Error;
-use libgblutils::aligned_subslice;
+use libgblutils::{aligned_subslice, shared::Shared};
 use safemath::SafeNum;
 use zbi::{ZbiContainer, ZbiFlags, ZbiType};
 use zerocopy::IntoBytes;
@@ -172,11 +172,13 @@ pub fn zircon_main<'a, 'b, G: GblOps<'a>>(
     let (enter_fastboot, oneshot_recovery) = zircon_check_boot_mode(ops);
     if enter_fastboot {
         gbl_println!(ops, "Entering fastboot mode...");
+        let async_task_state = Shared::from(AsyncTaskState::default());
         run_fastboot(GblFastbootEntry {
             ops,
             boot_buffer: (&mut load[..]).into(),
             result,
             load_result: None,
+            async_task_state: &async_task_state,
         });
         gbl_println!(ops, "Leaving fastboot mode...");
     }

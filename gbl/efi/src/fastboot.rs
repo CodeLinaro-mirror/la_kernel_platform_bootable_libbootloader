@@ -310,8 +310,9 @@ impl<'a> PinFutContainer<'a> for VecPinFut<'a> {
         &mut self,
         mut cb: impl FnMut(&mut Pin<&mut (dyn Future<Output = ()> + 'a)>, &mut FutContext) -> bool,
     ) {
-        // Polls in FIFO order so the oldest task runs as the head task (`HeadTaskGuard`), writes
-        // sequentially to disk, and releases its buffer to the pool first.
+        // Polls in FIFO order so the oldest task runs as the head task
+        // (`AsyncTaskState::is_head_task`), writes sequentially to disk, and releases its buffer
+        // to the pool first.
         let mut idx = 0;
         while idx < self.tasks.len() {
             let (f, b) = &mut self.tasks[idx];

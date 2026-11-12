@@ -18,8 +18,9 @@ use crate::{
     device_tree::{DtSourceLocation, SelectedDtComponentsMetadata},
     fastboot::{
         boot_items::{BootItem, BootItemContainer},
-        run_gbl_fastboot, run_gbl_fastboot_stack, split_loaded_android, GblFastbootResult,
-        GblFbData, GblGenericTransport, GblTcpStream, LoadedImageInfo, PinFutContainer,
+        run_gbl_fastboot, run_gbl_fastboot_stack, split_loaded_android, AsyncTaskState,
+        GblFastbootResult, GblFbData, GblGenericTransport, GblTcpStream, LoadedImageInfo,
+        PinFutContainer,
     },
     gbl_avb::{ArrayMaxParts, ArrayMaxSpecializedParts, LoadPartition, Verification},
     gbl_println,
@@ -587,6 +588,7 @@ pub struct GblFastbootEntry<'a, G> {
     pub(crate) boot_buffer: BootBuffer<'a>,
     pub(crate) result: &'a mut GblFastbootResult,
     pub(crate) load_result: Option<core::result::Result<LoadedImages<'a>, &'a IntegrationError>>,
+    pub(crate) async_task_state: &'a Shared<AsyncTaskState>,
 }
 
 impl<'a, 'b, G> GblFastbootEntry<'b, G>
@@ -618,7 +620,11 @@ where
         'a: 'd,
         'b: 'd,
     {
-        let data = GblFbData { boot_buffer: self.boot_buffer, load_result: self.load_result };
+        let data = GblFbData {
+            boot_buffer: self.boot_buffer,
+            load_result: self.load_result,
+            async_task_state: Some(self.async_task_state),
+        };
         *self.result = run_gbl_fastboot(self.ops, buffer_pool, tasks, transports, tcp, data).await;
         self.ops
     }
@@ -652,7 +658,11 @@ where
         // Splits into N download buffers.
         let pool: ArrayVec<_, N> =
             ArrayVec::from_iter(download.chunks_exact_mut(download.len() / N).map(Some));
-        let data = GblFbData { boot_buffer: self.boot_buffer, load_result: self.load_result };
+        let data = GblFbData {
+            boot_buffer: self.boot_buffer,
+            load_result: self.load_result,
+            async_task_state: Some(self.async_task_state),
+        };
         *self.result = block_on(run_gbl_fastboot_stack::<N>(self.ops, pool, transports, tcp, data));
         self.ops
     }
@@ -778,11 +788,13 @@ pub fn android_main<'a, 'b, G: GblOps<'a>>(
         (Some(OneShotBootMode::Bootloader), _) | (None, AndroidBootMode::BootloaderBootOnce)
     ) {
         gbl_println!(ops, "Entering fastboot mode...");
+        let async_task_state = Shared::from(AsyncTaskState::default());
         run_fastboot(GblFastbootEntry {
             ops,
             boot_buffer: boot_buffer.as_borrowed(),
             result,
             load_result: None,
+            async_task_state: &async_task_state,
         });
         gbl_println!(ops, "Leaving fastboot mode...");
 
@@ -835,7 +847,14 @@ pub fn android_main<'a, 'b, G: GblOps<'a>>(
         // Disable tracing for post-load fastboot as it is for debug/test only and not part of
         // normal functional flow.
         let _guard = trace::TraceGuard::new(false);
-        run_fastboot(GblFastbootEntry { ops, boot_buffer, result, load_result });
+        let async_task_state = Shared::from(AsyncTaskState::default());
+        run_fastboot(GblFastbootEntry {
+            ops,
+            boot_buffer,
+            result,
+            load_result,
+            async_task_state: &async_task_state,
+        });
         if paused_fastboot_continue_should_reboot() {
             gbl_println!(ops, "Device state may have changed. Rebooting...");
             ops.reboot()?;

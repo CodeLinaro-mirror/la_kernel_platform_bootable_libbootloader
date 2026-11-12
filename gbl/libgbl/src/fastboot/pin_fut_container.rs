@@ -12,99 +12,83 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(test)]
-use core::cell::Cell;
-#[cfg(not(test))]
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::{future::Future, pin::Pin};
 use gbl_async::poll_with_local_trace_config;
+use libgblutils::shared::Shared;
 
-#[cfg(not(test))]
-static IS_HEAD_TASK: AtomicBool = AtomicBool::new(true);
-#[cfg(not(test))]
-static WAITING_FOR_ASYNC_TASKS: AtomicUsize = AtomicUsize::new(0);
-
-#[cfg(test)]
-std::thread_local! {
-    static IS_HEAD_TASK: Cell<bool> = const { Cell::new(true) };
-    static WAITING_FOR_ASYNC_TASKS: Cell<usize> = const { Cell::new(0) };
+/// Per-session scheduling state shared between the foreground fastboot command loop and background
+/// async tasks.
+pub(crate) struct AsyncTaskState {
+    is_head_task: bool,
+    waiting_for_tasks: usize,
 }
 
-fn get_is_head_task() -> bool {
-    #[cfg(not(test))]
-    return IS_HEAD_TASK.load(Ordering::Relaxed);
+impl Default for AsyncTaskState {
+    fn default() -> Self {
+        Self { is_head_task: true, waiting_for_tasks: 0 }
+    }
+}
+
+impl AsyncTaskState {
+    /// Returns whether the currently polled async task is at the front of the task queue (or
+    /// running synchronously outside `poll_all`).
+    pub(crate) fn is_head_task(&self) -> bool {
+        self.is_head_task
+    }
+
     #[cfg(test)]
-    return IS_HEAD_TASK.get();
-}
-
-fn set_is_head_task(val: bool) {
-    #[cfg(not(test))]
-    IS_HEAD_TASK.store(val, Ordering::Relaxed);
-    #[cfg(test)]
-    IS_HEAD_TASK.set(val);
-}
-
-/// Returns whether the currently polled async task is at the front of the task queue (or running
-/// synchronously outside `poll_all`).
-pub(crate) fn is_head_task() -> bool {
-    get_is_head_task()
-}
-
-/// Returns whether the foreground fastboot session is currently blocked waiting for background
-/// async tasks to free capacity or complete, meaning no bulk download is in flight.
-pub fn is_waiting_for_async_tasks() -> bool {
-    #[cfg(not(test))]
-    return WAITING_FOR_ASYNC_TASKS.load(Ordering::Relaxed) > 0;
-    #[cfg(test)]
-    return WAITING_FOR_ASYNC_TASKS.get() > 0;
+    pub(crate) fn is_waiting_for_tasks(&self) -> bool {
+        self.waiting_for_tasks > 0
+    }
 }
 
 /// RAII guard marking that the foreground fastboot session is blocked waiting on background async
-/// tasks, allowing synchronous storage backends to complete the active task's remaining write in a
-/// single unchunked call without risking network RX ring overflow.
+/// tasks.
 #[must_use]
-pub struct WaitingForAsyncTasksGuard(());
+pub(crate) struct WaitingForAsyncTasksGuard<'a>(Option<&'a Shared<AsyncTaskState>>);
 
-impl WaitingForAsyncTasksGuard {
-    /// Enters a foreground wait on background async tasks.
-    pub fn new() -> Self {
-        #[cfg(not(test))]
-        WAITING_FOR_ASYNC_TASKS.fetch_add(1, Ordering::Relaxed);
-        #[cfg(test)]
-        WAITING_FOR_ASYNC_TASKS.set(WAITING_FOR_ASYNC_TASKS.get() + 1);
-        Self(())
+impl<'a> WaitingForAsyncTasksGuard<'a> {
+    /// Enters a foreground wait on background async tasks when `state` is `Some`.
+    pub(crate) fn new(state: Option<&'a Shared<AsyncTaskState>>) -> Self {
+        if let Some(s) = state {
+            s.borrow_mut().waiting_for_tasks += 1;
+        }
+        Self(state)
     }
 }
 
-impl Default for WaitingForAsyncTasksGuard {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Drop for WaitingForAsyncTasksGuard {
+impl Drop for WaitingForAsyncTasksGuard<'_> {
     fn drop(&mut self) {
-        #[cfg(not(test))]
-        WAITING_FOR_ASYNC_TASKS.fetch_sub(1, Ordering::Relaxed);
-        #[cfg(test)]
-        WAITING_FOR_ASYNC_TASKS.set(WAITING_FOR_ASYNC_TASKS.get() - 1);
+        if let Some(s) = self.0 {
+            s.borrow_mut().waiting_for_tasks -= 1;
+        }
     }
 }
 
 #[must_use]
-struct HeadTaskGuard(bool);
+struct PollPassGuard<'a> {
+    state: Option<&'a Shared<AsyncTaskState>>,
+    prev_is_head_task: bool,
+}
 
-impl HeadTaskGuard {
-    fn new(is_head: bool) -> Self {
-        let prev = get_is_head_task();
-        set_is_head_task(is_head);
-        Self(prev)
+impl<'a> PollPassGuard<'a> {
+    fn new(state: Option<&'a Shared<AsyncTaskState>>) -> Self {
+        let prev_is_head_task = state.is_none_or(|s| s.borrow().is_head_task);
+        Self { state, prev_is_head_task }
+    }
+
+    fn set_head_task(&self, is_head: bool) {
+        if let Some(s) = self.state {
+            s.borrow_mut().is_head_task = is_head;
+        }
     }
 }
 
-impl Drop for HeadTaskGuard {
+impl Drop for PollPassGuard<'_> {
     fn drop(&mut self) {
-        set_is_head_task(self.0);
+        if let Some(s) = self.state {
+            s.borrow_mut().is_head_task = self.prev_is_head_task;
+        }
     }
 }
 
@@ -147,10 +131,11 @@ pub(crate) trait PinFutContainerTyped<'a, F: Future + 'a> {
     );
 
     /// Polls all the [Future] once. Returns the number or unfinished ones.
-    fn poll_all(&mut self) -> usize {
+    fn poll_all(&mut self, state: Option<&Shared<AsyncTaskState>>) -> usize {
+        let pass_guard = PollPassGuard::new(state);
         let mut res = 0;
         self.for_each_remove_if(|v, b| {
-            let _guard = HeadTaskGuard::new(res == 0);
+            pass_guard.set_head_task(res == 0);
             let finished = poll_with_local_trace_config(v, &mut b.trace_config).is_some();
             res += usize::from(!finished);
             finished
@@ -161,7 +146,13 @@ pub(crate) trait PinFutContainerTyped<'a, F: Future + 'a> {
     /// Runs until all futures are finished
     #[cfg(test)]
     fn run(&mut self) {
-        while self.poll_all() > 0 {}
+        while self.poll_all(None) > 0 {}
+    }
+
+    /// Runs until all futures are finished, updating `state` on each poll pass.
+    #[cfg(test)]
+    fn run_with_state(&mut self, state: &Shared<AsyncTaskState>) {
+        while self.poll_all(Some(state)) > 0 {}
     }
 }
 
@@ -214,5 +205,71 @@ impl<'a, F: Future<Output = ()> + 'a> PinFutContainerTyped<'a, F> for PinFutSlic
                 idx += 1;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use gbl_async::yield_now;
+
+    #[test]
+    fn test_async_task_state_guards_and_head_tracking() {
+        let state = Shared::from(AsyncTaskState::default());
+        assert!(state.borrow().is_head_task());
+        assert!(!state.borrow().is_waiting_for_tasks());
+
+        // `None` guard is a safe no-op; nested `Some` guards reference-count foreground waits.
+        {
+            let _noop = WaitingForAsyncTasksGuard::new(None);
+            assert!(!state.borrow().is_waiting_for_tasks());
+            let _g1 = WaitingForAsyncTasksGuard::new(Some(&state));
+            assert!(state.borrow().is_waiting_for_tasks());
+            {
+                let _g2 = WaitingForAsyncTasksGuard::new(Some(&state));
+                assert!(state.borrow().is_waiting_for_tasks());
+            }
+            assert!(state.borrow().is_waiting_for_tasks());
+        }
+        assert!(!state.borrow().is_waiting_for_tasks());
+
+        // FIFO `poll_all` marks only the oldest unfinished task as the head task.
+        let log = Shared::from(Vec::new());
+        let mut tasks: Vec<(Pin<Box<dyn Future<Output = ()>>>, FutContext)> = Vec::new();
+        PinFutContainer::add_with(&mut tasks, || {
+            let (state, log) = (&state, &log);
+            async move {
+                log.borrow_mut().push((0, state.borrow().is_head_task()));
+                yield_now().await;
+                log.borrow_mut().push((0, state.borrow().is_head_task()));
+            }
+        });
+        PinFutContainer::add_with(&mut tasks, || {
+            let (state, log) = (&state, &log);
+            async move {
+                log.borrow_mut().push((1, state.borrow().is_head_task()));
+                yield_now().await;
+                log.borrow_mut().push((1, state.borrow().is_head_task()));
+                yield_now().await;
+                log.borrow_mut().push((1, state.borrow().is_head_task()));
+            }
+        });
+
+        assert_eq!(
+            PinFutContainerTyped::<core::future::Pending<()>>::poll_all(&mut tasks, Some(&state)),
+            2
+        );
+        // Pass 2 completes task 0 (`res` stays 0), so task 1 immediately becomes the head task in
+        // pass 2 and finishes in pass 3.
+        assert_eq!(
+            PinFutContainerTyped::<core::future::Pending<()>>::poll_all(&mut tasks, Some(&state)),
+            1
+        );
+        assert_eq!(
+            PinFutContainerTyped::<core::future::Pending<()>>::poll_all(&mut tasks, Some(&state)),
+            0
+        );
+        assert_eq!(*log.borrow(), vec![(0, true), (1, false), (0, true), (1, true), (1, true)]);
+        assert!(state.borrow().is_head_task());
     }
 }
