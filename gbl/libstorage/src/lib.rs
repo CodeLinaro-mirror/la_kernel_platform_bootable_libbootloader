@@ -183,6 +183,12 @@ pub unsafe trait BlockIo {
     /// Returns the `BlockInfo` for this block device.
     fn info(&self) -> BlockInfo;
 
+    /// Returns whether `read_blocks`, `write_blocks`, and `erase_blocks` execute asynchronously
+    /// without blocking the caller until storage I/O completes.
+    fn is_async(&self) -> bool {
+        false
+    }
+
     /// Read blocks of data from the block device
     ///
     /// # Args
@@ -358,6 +364,10 @@ where
         self.deref().info()
     }
 
+    fn is_async(&self) -> bool {
+        self.deref().is_async()
+    }
+
     async fn read_blocks<'a>(
         &self,
         blk_offset: u64,
@@ -488,6 +498,11 @@ impl<T: BlockIo, P: BufferPool> Disk<T, P> {
     /// Gets the [BlockInfo]
     pub fn block_info(&self) -> BlockInfo {
         self.io.info()
+    }
+
+    /// Returns whether the underlying [BlockIo] executes I/O asynchronously.
+    pub fn is_async(&self) -> bool {
+        self.io.is_async()
     }
 
     /// Gets the underlying BlockIo implementation.
@@ -1367,5 +1382,30 @@ mod test {
         let expected_erased: Vec<u8> = orig[..1025].iter().map(|v| !*v).collect();
         assert_eq!(&disk.io().storage()[..1025], expected_erased.as_slice());
         assert_eq!(&disk.io().storage()[1025..], &orig[1025..]);
+    }
+
+    #[test]
+    fn test_block_io_is_async() {
+        fn check_is_async(io: impl BlockIo) -> bool {
+            io.is_async()
+        }
+
+        let mut disk = TestDisk::new_ram_alloc(512, 32, vec![0u8; KiB!(4)]).unwrap();
+        assert!(!disk.io().is_async());
+        assert!(!check_is_async(disk.io()));
+        assert!(!disk.is_async());
+        assert!(!disk.as_sync().is_async());
+
+        disk.io_mut().set_async(true);
+        assert!(disk.io().is_async());
+        assert!(check_is_async(disk.io()));
+        assert!(disk.is_async());
+        // `BlockIoSync` always executes blocking I/O even when wrapping an async `BlockIo`.
+        assert!(!disk.as_sync().is_async());
+        assert!(!check_is_async(BlockIoSync(disk.io())));
+
+        let mut raw_io = RamBlockIo::new(512, 32, vec![0u8; KiB!(4)]);
+        raw_io.set_async(true);
+        assert!(check_is_async(Box::new(raw_io)));
     }
 }

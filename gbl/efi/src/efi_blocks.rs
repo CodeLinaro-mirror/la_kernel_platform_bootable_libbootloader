@@ -59,6 +59,10 @@ unsafe impl BlockIo for EfiBlockDeviceIo<'_> {
         self.block_info
     }
 
+    fn is_async(&self) -> bool {
+        self.block_io2.is_some()
+    }
+
     async fn read_blocks<'a>(
         &self,
         blk_offset: u64,

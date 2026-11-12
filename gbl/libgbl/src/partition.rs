@@ -447,6 +447,11 @@ impl<'a, B: BlockIo, P: BufferPool, const N: usize, A: AccessMode>
             .min()
             .unwrap_or(0)
     }
+
+    /// Returns whether all underlying disks perform asynchronous block I/O.
+    pub fn is_async(&self) -> bool {
+        self.disks.iter().all(|d| d.is_async())
+    }
 }
 
 /// [ReadWrite] implementation.
@@ -1207,5 +1212,32 @@ pub(crate) mod test {
             part_io.read(KiB!(2), read_buf.as_mut_slice()).await.unwrap();
             assert_eq!(read_buf, write_2_buf);
         });
+    }
+
+    #[test]
+    fn test_multi_partition_io_is_async() {
+        let mut devs = FakeGblOpsStorage::default();
+        devs.add_raw_device(c"part_a", [0u8; KiB!(4)]);
+        devs.add_raw_device(c"part_b", [0u8; KiB!(4)]);
+
+        assert!(!devs[0].partition_io(Some("part_a")).unwrap().is_async());
+        assert!(!find_multi_partition_io::<_, _, 2, ReadWrite>(&devs, &["part_a", "part_b"])
+            .unwrap()
+            .is_async());
+
+        // If only one of multiple underlying disks is async, `MultiPartitionIo::is_async()` must
+        // remain false so synchronous storage writes are still identified.
+        devs[0].get_blk_io().set_async(true);
+        assert!(devs[0].partition_io(Some("part_a")).unwrap().is_async());
+        assert!(!devs[0].as_sync().unwrap().partition_io(Some("part_a")).unwrap().is_async());
+        assert!(!find_multi_partition_io::<_, _, 2, ReadWrite>(&devs, &["part_a", "part_b"])
+            .unwrap()
+            .is_async());
+
+        // Once all underlying disks are async, `MultiPartitionIo::is_async()` returns true.
+        devs[1].get_blk_io().set_async(true);
+        assert!(find_multi_partition_io::<_, _, 2, ReadWrite>(&devs, &["part_a", "part_b"])
+            .unwrap()
+            .is_async());
     }
 }

@@ -53,6 +53,8 @@ pub struct RamBlockIo<T> {
     /// This is private because tests should not depend on the exact number of yields.
     /// See [set_blocking] for more info.
     yields: usize,
+    /// Whether this device reports asynchronous I/O capability (`BlockIo::is_async`).
+    is_async: bool,
 }
 
 impl<T: DerefMut<Target = [u8]>> RamBlockIo<T> {
@@ -74,7 +76,28 @@ impl<T: DerefMut<Target = [u8]>> RamBlockIo<T> {
             num_accesses: (0, 0).into(),
             error: None.into(),
             yields: 0,
+            is_async: false,
         }
+    }
+
+    /// Configures whether `BlockIo::is_async()` returns true for this device.
+    pub fn set_async(&mut self, is_async: bool) {
+        self.is_async = is_async;
+    }
+
+    /// Gets the number of successful read operations.
+    pub fn num_reads(&self) -> usize {
+        self.num_accesses.borrow().0
+    }
+
+    /// Gets the number of successful write operations.
+    pub fn num_writes(&self) -> usize {
+        self.num_accesses.borrow().1
+    }
+
+    /// Resets the read/write operation counters.
+    pub fn reset_accesses(&self) {
+        *self.num_accesses.borrow_mut() = (0, 0);
     }
 
     /// Configures the blocking behavior.
@@ -146,6 +169,10 @@ unsafe impl<T: DerefMut<Target = [u8]>> BlockIo for RamBlockIo<T> {
         }
     }
 
+    fn is_async(&self) -> bool {
+        self.is_async
+    }
+
     async fn read_blocks<'a>(
         &self,
         blk_offset: u64,
@@ -199,16 +226,6 @@ pub(crate) mod test {
         /// Gets the underlying ramdisk storage mutably.
         pub(crate) fn storage_mut(&self) -> RefMut<'_, [u8]> {
             RefMut::map(self.storage.borrow_mut(), |s| s.deref_mut())
-        }
-
-        /// Gets the number of successful read operations
-        pub(crate) fn num_reads(&self) -> usize {
-            self.num_accesses.borrow().0
-        }
-
-        /// Gets the number of successful write operations
-        pub(crate) fn num_writes(&self) -> usize {
-            self.num_accesses.borrow().1
         }
     }
 }
