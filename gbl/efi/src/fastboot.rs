@@ -287,22 +287,39 @@ impl Drop for EfiFastbootTransport<'_> {
     }
 }
 
-// Wrapper of vector of pinned futures.
-#[derive(Default)]
-struct VecPinFut<'a>(Vec<(Pin<Box<dyn Future<Output = ()> + 'a>>, FutContext)>);
+// Wrapper of a bounded FIFO queue of pinned futures.
+struct VecPinFut<'a> {
+    tasks: Vec<(Pin<Box<dyn Future<Output = ()> + 'a>>, FutContext)>,
+    max_tasks: usize,
+}
+
+impl VecPinFut<'_> {
+    fn new(max_tasks: usize) -> Self {
+        Self { tasks: Vec::with_capacity(max_tasks), max_tasks }
+    }
+}
 
 impl<'a> PinFutContainer<'a> for VecPinFut<'a> {
     fn add_with<F: Future<Output = ()> + 'a>(&mut self, f: impl FnOnce() -> F) {
-        self.0.push((Box::pin(f()), FutContext { trace_config: true }));
+        if self.tasks.len() < self.max_tasks {
+            self.tasks.push((Box::pin(f()), FutContext { trace_config: true }));
+        }
     }
 
     fn for_each_remove_if(
         &mut self,
         mut cb: impl FnMut(&mut Pin<&mut (dyn Future<Output = ()> + 'a)>, &mut FutContext) -> bool,
     ) {
-        for idx in (0..self.0.len()).rev() {
-            let (f, b) = &mut self.0[idx];
-            cb(&mut f.as_mut(), b).then(|| self.0.swap_remove(idx));
+        // Polls in FIFO order so the oldest task runs as the head task (`HeadTaskGuard`), writes
+        // sequentially to disk, and releases its buffer to the pool first.
+        let mut idx = 0;
+        while idx < self.tasks.len() {
+            let (f, b) = &mut self.tasks[idx];
+            if cb(&mut f.as_mut(), b) {
+                drop(self.tasks.remove(idx));
+            } else {
+                idx += 1;
+            }
         }
     }
 }
@@ -400,6 +417,52 @@ pub(crate) fn efi_gbl_fastboot_entry<'a, G: GblOps<'a>>(
     let mut bufs: ArrayVec<Option<&mut [u8]>, GBL_FB_N> =
         ArrayVec::from_iter(buffer.chunks_exact_mut(buffer.len() / GBL_FB_N).map(Some));
     let bufs = &(bufs.as_mut_slice()).into();
-    let mut fut = Box::pin(fb.run(bufs, VecPinFut::default(), &mut transport_protocols, tcp));
+    let mut fut = Box::pin(fb.run(bufs, VecPinFut::new(GBL_FB_N), &mut transport_protocols, tcp));
     block_on_mut(&mut fut);
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use core::cell::RefCell;
+
+    #[test]
+    fn test_vec_pin_fut_fifo_and_capacity_bound() {
+        let log = RefCell::new(Vec::new());
+        let mut q = VecPinFut::new(2);
+        let mut dropped_created = false;
+
+        q.add_with(|| async { log.borrow_mut().push(1) });
+        q.add_with(|| async { log.borrow_mut().push(2) });
+        // Third task exceeds capacity and must not even evaluate the closure.
+        q.add_with(|| {
+            dropped_created = true;
+            async { log.borrow_mut().push(3) }
+        });
+        assert!(!dropped_created);
+
+        let mut visit_order = Vec::new();
+        let mut step = 0usize;
+        q.for_each_remove_if(|f, _| {
+            step += 1;
+            visit_order.push(step);
+            // Complete only the first task on this pass so task #2 shifts to index 0.
+            if step == 1 {
+                block_on_mut(f);
+                true
+            } else {
+                false
+            }
+        });
+        assert_eq!(visit_order, vec![1, 2]);
+        assert_eq!(*log.borrow(), vec![1]);
+
+        // Now one slot is free again and task #3 queues behind task #2.
+        q.add_with(|| async { log.borrow_mut().push(3) });
+        q.for_each_remove_if(|f, _| {
+            block_on_mut(f);
+            true
+        });
+        assert_eq!(*log.borrow(), vec![1, 2, 3]);
+    }
 }

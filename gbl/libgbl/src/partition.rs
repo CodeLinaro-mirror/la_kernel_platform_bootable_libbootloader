@@ -460,15 +460,16 @@ impl<'a, B: BlockIo, P: BufferPool, const N: usize> MultiPartitionIo<'a, B, P, N
         Ok(())
     }
 
-    /// Writes sparse image to the partition.
-    pub async fn write_sparse(&self, img: &mut [u8]) -> Result<(), Error> {
+    /// Writes sparse image in `buf[..img_size]` to the partition, using `buf` as fill scratch.
+    pub async fn write_sparse(&self, buf: &mut [u8], img_size: usize) -> Result<(), Error> {
+        let img = buf.get(..img_size).ok_or(Error::InvalidInput)?;
         let sz = is_sparse_image(img).map_err(|_| Error::InvalidInput)?.data_size();
         // Initial size check against the declared data size from the header for fail-fast in the
         // common case to avoid partial writes. Each chunk I/O also checks its boundaries in case
         // the declared header size doesn't agree with the chunk information.
         let _ = self.check_rw_range(0, sz)?;
         let mut writer = self;
-        write_sparse_image(img, &mut writer).await?;
+        write_sparse_image(buf, img_size, &mut writer).await?;
         Ok(())
     }
 
@@ -948,12 +949,13 @@ pub(crate) mod test {
         let mut sparse = include_bytes!("../testdata/sparse_test.bin").to_vec();
         let raw = &vec![0u8; sparse_raw.len() + 512][..];
         let blk = raw_disk(c"raw", raw);
+        let sparse_len = sparse.len();
         block_on(
             blk.partition_io(Some("raw"))
                 .unwrap()
                 .sub(1, u64::try_from(raw.len() - 1).unwrap())
                 .unwrap()
-                .write_sparse(&mut sparse),
+                .write_sparse(&mut sparse, sparse_len),
         )
         .unwrap();
         let mut expected = vec![0u8; raw.len()];
@@ -965,6 +967,7 @@ pub(crate) mod test {
     fn test_write_sparse_multi_part() {
         let sparse_raw = include_bytes!("../testdata/sparse_test_raw.bin");
         let mut sparse = include_bytes!("../testdata/sparse_test.bin").to_vec();
+        let sparse_len = sparse.len();
         let mut devs = FakeGblOpsStorage::default();
         devs.add_raw_device(c"raw_0", vec![0u8; sparse_raw.len() + 512]);
         devs.add_raw_device(c"raw_1", vec![0u8; sparse_raw.len() + 1024]);
@@ -972,7 +975,7 @@ pub(crate) mod test {
             let mut io =
                 find_multi_partition_io::<_, _, _, ReadWrite>(&devs, &["raw_0", "raw_1"]).unwrap();
             io = io.sub(1, u64::try_from(sparse_raw.len()).unwrap()).unwrap();
-            block_on(io.write_sparse(&mut sparse)).unwrap();
+            block_on(io.write_sparse(&mut sparse, sparse_len)).unwrap();
         }
         let mut expected = vec![0u8; sparse_raw.len() + 1];
         expected[1..][..sparse_raw.len()].clone_from_slice(sparse_raw);
@@ -984,17 +987,31 @@ pub(crate) mod test {
     fn test_write_sparse_not_sparse_image() {
         let sparse_raw = include_bytes!("../testdata/sparse_test_raw.bin");
         let mut sparse = include_bytes!("../testdata/sparse_test.bin").to_vec();
+        let sparse_len = sparse.len();
         sparse[0] = !sparse[0]; // Corrupt image.
         let raw = raw_disk(c"raw", vec![0u8; sparse_raw.len() + 512]);
-        assert!(block_on(raw.partition_io(Some("raw")).unwrap().write_sparse(&mut sparse)).is_err());
+        assert!(block_on(
+            raw.partition_io(Some("raw")).unwrap().write_sparse(&mut sparse, sparse_len)
+        )
+        .is_err());
     }
 
     #[test]
     fn test_write_sparse_overflow_size() {
         let sparse_raw = include_bytes!("../testdata/sparse_test_raw.bin");
         let mut sparse = include_bytes!("../testdata/sparse_test.bin").to_vec();
+        let sparse_len = sparse.len();
         let raw = raw_disk(c"raw", vec![0u8; sparse_raw.len() - 1]);
-        assert!(block_on(raw.partition_io(Some("raw")).unwrap().write_sparse(&mut sparse)).is_err());
+        assert!(block_on(
+            raw.partition_io(Some("raw")).unwrap().write_sparse(&mut sparse, sparse_len)
+        )
+        .is_err());
+        assert_eq!(
+            block_on(
+                raw.partition_io(Some("raw")).unwrap().write_sparse(&mut sparse, sparse_len + 1)
+            ),
+            Err(Error::InvalidInput)
+        );
     }
 
     #[test]

@@ -12,8 +12,101 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(test)]
+use core::cell::Cell;
+#[cfg(not(test))]
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::{future::Future, pin::Pin};
 use gbl_async::poll_with_local_trace_config;
+
+#[cfg(not(test))]
+static IS_HEAD_TASK: AtomicBool = AtomicBool::new(true);
+#[cfg(not(test))]
+static WAITING_FOR_ASYNC_TASKS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+std::thread_local! {
+    static IS_HEAD_TASK: Cell<bool> = const { Cell::new(true) };
+    static WAITING_FOR_ASYNC_TASKS: Cell<usize> = const { Cell::new(0) };
+}
+
+fn get_is_head_task() -> bool {
+    #[cfg(not(test))]
+    return IS_HEAD_TASK.load(Ordering::Relaxed);
+    #[cfg(test)]
+    return IS_HEAD_TASK.get();
+}
+
+fn set_is_head_task(val: bool) {
+    #[cfg(not(test))]
+    IS_HEAD_TASK.store(val, Ordering::Relaxed);
+    #[cfg(test)]
+    IS_HEAD_TASK.set(val);
+}
+
+/// Returns whether the currently polled async task is at the front of the task queue (or running
+/// synchronously outside `poll_all`).
+pub(crate) fn is_head_task() -> bool {
+    get_is_head_task()
+}
+
+/// Returns whether the foreground fastboot session is currently blocked waiting for background
+/// async tasks to free capacity or complete, meaning no bulk download is in flight.
+pub fn is_waiting_for_async_tasks() -> bool {
+    #[cfg(not(test))]
+    return WAITING_FOR_ASYNC_TASKS.load(Ordering::Relaxed) > 0;
+    #[cfg(test)]
+    return WAITING_FOR_ASYNC_TASKS.get() > 0;
+}
+
+/// RAII guard marking that the foreground fastboot session is blocked waiting on background async
+/// tasks, allowing synchronous storage backends to complete the active task's remaining write in a
+/// single unchunked call without risking network RX ring overflow.
+#[must_use]
+pub struct WaitingForAsyncTasksGuard(());
+
+impl WaitingForAsyncTasksGuard {
+    /// Enters a foreground wait on background async tasks.
+    pub fn new() -> Self {
+        #[cfg(not(test))]
+        WAITING_FOR_ASYNC_TASKS.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        WAITING_FOR_ASYNC_TASKS.set(WAITING_FOR_ASYNC_TASKS.get() + 1);
+        Self(())
+    }
+}
+
+impl Default for WaitingForAsyncTasksGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for WaitingForAsyncTasksGuard {
+    fn drop(&mut self) {
+        #[cfg(not(test))]
+        WAITING_FOR_ASYNC_TASKS.fetch_sub(1, Ordering::Relaxed);
+        #[cfg(test)]
+        WAITING_FOR_ASYNC_TASKS.set(WAITING_FOR_ASYNC_TASKS.get() - 1);
+    }
+}
+
+#[must_use]
+struct HeadTaskGuard(bool);
+
+impl HeadTaskGuard {
+    fn new(is_head: bool) -> Self {
+        let prev = get_is_head_task();
+        set_is_head_task(is_head);
+        Self(prev)
+    }
+}
+
+impl Drop for HeadTaskGuard {
+    fn drop(&mut self) {
+        set_is_head_task(self.0);
+    }
+}
 
 /// Represents a future local context data.
 #[derive(Default)]
@@ -30,7 +123,8 @@ pub trait PinFutContainer<'a> {
     /// If operation cannot be performed, such as due to no capacity, `f` should not be called.
     fn add_with<F: Future<Output = ()> + 'a>(&mut self, f: impl FnOnce() -> F);
 
-    /// Calls the closure on each element in the container. Removes the element if it returns true.
+    /// Calls the closure on each element in the container in FIFO insertion order, removing any
+    /// element for which it returns `true`.
     fn for_each_remove_if(
         &mut self,
         cb: impl FnMut(&mut Pin<&mut (dyn Future<Output = ()> + 'a)>, &mut FutContext) -> bool,
@@ -45,7 +139,8 @@ pub(crate) trait PinFutContainerTyped<'a, F: Future + 'a> {
     /// If operation cannot be performed, such as due to no capacity, `f` should not be called.
     fn add_with(&mut self, f: impl FnOnce() -> F);
 
-    /// Calls the closure on each element in the container. Removes the element if it returns true.
+    /// Calls the closure on each element in the container in FIFO insertion order, removing any
+    /// element for which it returns `true`.
     fn for_each_remove_if(
         &mut self,
         cb: impl FnMut(&mut Pin<&mut (dyn Future<Output = ()> + 'a)>, &mut FutContext) -> bool,
@@ -55,6 +150,7 @@ pub(crate) trait PinFutContainerTyped<'a, F: Future + 'a> {
     fn poll_all(&mut self) -> usize {
         let mut res = 0;
         self.for_each_remove_if(|v, b| {
+            let _guard = HeadTaskGuard::new(res == 0);
             let finished = poll_with_local_trace_config(v, &mut b.trace_config).is_some();
             res += usize::from(!finished);
             finished
@@ -108,12 +204,14 @@ impl<'a, F: Future<Output = ()> + 'a> PinFutContainerTyped<'a, F> for PinFutSlic
         &mut self,
         mut cb: impl FnMut(&mut Pin<&mut (dyn Future<Output = ()> + 'a)>, &mut FutContext) -> bool,
     ) {
-        // Iterates from the end because we swap remove with the last.
-        for idx in (0..self.used).rev() {
+        // Polls in FIFO order; rotating `Pin<&mut F>` pointers preserves the pinned `F` storage.
+        let mut idx = 0;
+        while idx < self.used {
             if cb(&mut (self.arr[idx].0.as_mut() as _), &mut self.arr[idx].1) {
-                // Swaps remove with the last element
+                self.arr[idx..self.used].rotate_left(1);
                 self.used -= 1;
-                self.arr.swap(idx, self.used);
+            } else {
+                idx += 1;
             }
         }
     }

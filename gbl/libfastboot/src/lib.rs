@@ -656,6 +656,19 @@ pub trait FastbootImplementation {
     ///
     /// * `message`: A displayable object to be printed.
     fn log_line(&mut self, message: impl Display);
+
+    /// Logs a command received from the host.
+    ///
+    /// The default implementation logs `"Fastboot Command: <cmd>"` with [Self::log_line].
+    /// Implementations can override it, e.g. to summarize frequent commands instead of logging
+    /// each of them on a slow console.
+    ///
+    /// # Args
+    ///
+    /// * `cmd`: The command string.
+    fn log_command(&mut self, cmd: &str) {
+        self.log_line(format_args!("Fastboot Command: {cmd}"))
+    }
 }
 
 /// A download builder/downloader with data from buffer.
@@ -1558,7 +1571,7 @@ pub async fn process_next_command(
     };
     // Checks utf8 encoding first. This is required by `cmd_to_c_string_args`.
     match from_utf8(&packet[..cmd_size]) {
-        Ok(v) => fb_impl.log_line(format_args!("Fastboot Command: {v}")),
+        Ok(v) => fb_impl.log_command(v),
         _ => {
             transport.send_packet(fastboot_fail!(packet, "Invalid Command")).await?;
             return Ok(false);

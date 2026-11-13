@@ -75,7 +75,10 @@ use libgblutils::{
     buffer_pool::{BufferPool, ScopedBuffer},
     shared::Shared,
 };
-use libutils::{constants::KiB, next_arg, FormattedBytes, FromHexStr};
+use libutils::{
+    constants::{KiB, MiB},
+    next_arg, FormattedBytes, FromHexStr,
+};
 use safemath::SafeNum;
 use trace::{gbl_trace_get_enable, TraceGuard};
 #[cfg(feature = "fuchsia")]
@@ -91,8 +94,10 @@ pub(crate) mod sparse;
 use sparse::is_sparse_image;
 
 mod pin_fut_container;
-pub use pin_fut_container::{FutContext, PinFutContainer};
-use pin_fut_container::{PinFutContainerTyped, PinFutSlice};
+use pin_fut_container::{is_head_task, PinFutContainerTyped, PinFutSlice};
+pub use pin_fut_container::{
+    is_waiting_for_async_tasks, FutContext, PinFutContainer, WaitingForAsyncTasksGuard,
+};
 
 // Re-exports dependency types
 pub use fastboot::{TcpStream, Transport};
@@ -110,14 +115,98 @@ const SUPER_PARTITION: &str = "super";
 /// This is determined by the maximum number slots supported.
 const MAX_IO_PARTS: usize = 2;
 
+/// Maximum number of bytes of a buffer that a fill task fills with its pattern and then writes
+/// repeatedly. Filling a whole download buffer (hundreds of MiB) would cost tens of milliseconds
+/// of CPU time per `stream-fill`, while an 8 MiB chunk initializes in well under a millisecond and
+/// amortizes synchronous block write overhead across large transfers.
+pub(crate) const MAX_FILL_CHUNK_SIZE: usize = MiB!(8);
+
+/// Number of bytes hashed between yields when computing the CRC32 of downloaded data.
+///
+/// GBL's native TCP stack needs CPU time to process incoming frames, and hashing too much data at
+/// once delays it. A chunk takes some tens of microseconds, which the network device absorbs.
+const CRC_CHUNK_SIZE: usize = KiB!(64);
+
+/// Downloads at least this large are logged once complete.
+const LOG_DOWNLOAD_MIN_SIZE: usize = MiB!(128);
+
+/// Tracks runs of data commands (`download`, `stream-flash` and `stream-fill`) so that only the
+/// first command of a run is logged and the rest are summarized when the run ends.
+#[derive(Default)]
+struct DataCommandLog {
+    // Whether the first command of a run was logged.
+    in_run: bool,
+    // Numbers of the run's commands that were not logged, by command.
+    download: usize,
+    stream_flash: usize,
+    stream_fill: usize,
+}
+
+impl DataCommandLog {
+    /// Returns the counter for `cmd` if it is a data command.
+    fn counter(&mut self, cmd: &str) -> Option<&mut usize> {
+        match cmd.split(':').next() {
+            Some("download") => Some(&mut self.download),
+            Some("stream-flash") => Some(&mut self.stream_flash),
+            Some("stream-fill") => Some(&mut self.stream_fill),
+            _ => None,
+        }
+    }
+
+    /// Starts a run of data commands if `cmd` is one, after its caller logged it.
+    fn start(&mut self, cmd: &str) {
+        self.in_run = self.counter(cmd).is_some();
+    }
+
+    /// Counts `cmd` instead of logging it if it continues a run of data commands.
+    ///
+    /// Returns whether `cmd` was counted.
+    fn add(&mut self, cmd: &str) -> bool {
+        if !self.in_run {
+            return false;
+        }
+        match self.counter(cmd) {
+            Some(v) => {
+                *v += 1;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Ends the current run, if any. Returns the run's counts if any command was counted.
+    fn take(&mut self) -> Option<Self> {
+        let log = take(self);
+        (log.download + log.stream_flash + log.stream_fill > 0).then_some(log)
+    }
+}
+
+impl Display for DataCommandLog {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let total = self.download + self.stream_flash + self.stream_fill;
+        write!(f, "{total} more:")?;
+        let counts = [
+            ("download", self.download),
+            ("stream-flash", self.stream_flash),
+            ("stream-fill", self.stream_fill),
+        ];
+        let mut sep = "";
+        for (cmd, count) in counts.into_iter().filter(|(_, v)| *v > 0) {
+            write!(f, "{sep} {cmd} x{count}")?;
+            sep = ",";
+        }
+        Ok(())
+    }
+}
+
 /// Represents the workload of a GBL Fastboot async task.
 enum TaskWorkload<'a, 'b, B: BlockIo, P2: BufferPool, P: BufferPool> {
     /// Image flashing task. (partition io, downloaded data, data size)
     Flash(MultiPartitionIo<'a, B, P2, MAX_IO_PARTS, ReadWrite>, ScopedBuffer<'b, P>, usize),
-    /// Sparse image flashing task. (partition io, downloaded data)
-    FlashSparse(MultiPartitionIo<'a, B, P2, MAX_IO_PARTS, ReadWrite>, ScopedBuffer<'b, P>),
-    /// Fill a partition range with a 32 bit value. (partition io, fill buffer, value)
-    Fill(MultiPartitionIo<'a, B, P2, MAX_IO_PARTS, ReadWrite>, ScopedBuffer<'b, P>, u32),
+    /// Sparse image flashing task. (partition io, downloaded data, data size)
+    FlashSparse(MultiPartitionIo<'a, B, P2, MAX_IO_PARTS, ReadWrite>, ScopedBuffer<'b, P>, usize),
+    /// Fill a partition range with a 32 bit value. (partition io, buffer pool, value)
+    Fill(MultiPartitionIo<'a, B, P2, MAX_IO_PARTS, ReadWrite>, &'b Shared<P>, u32),
     /// Image erase task.
     Erase(MultiPartitionIo<'a, B, P2, MAX_IO_PARTS, ReadWrite>, ScopedBuffer<'b, P>),
     None,
@@ -128,14 +217,23 @@ impl<'a, 'b, B: BlockIo, P2: BufferPool, P: BufferPool> TaskWorkload<'a, 'b, B, 
     async fn run(&mut self) -> Result<(), Error> {
         let res = match self {
             Self::Flash(io, data, size) => io.write(0, &mut data[..*size]).await,
-            Self::FlashSparse(io, data) => io.write_sparse(data).await,
-            Self::Fill(io, buffer, payload) => {
+            Self::FlashSparse(io, data, size) => io.write_sparse(data, *size).await,
+            Self::Fill(io, pool, payload) => {
+                // Wait until earlier queued tasks have finished before taking a download buffer
+                // from `pool` so a `stream-fill` queued behind a `stream-flash` leaves the second
+                // pool buffer free for the next concurrent `download`.
+                while !is_head_task() {
+                    yield_now().await;
+                }
+                let mut buffer =
+                    if let Some(buf) = pool.allocate() { buf } else { pool.allocate_async().await };
                 let io_size = io.size_bytes();
 
                 // SAFETY: All bit values are valid for u32.
                 let (_, fill_buffer, _) = unsafe { buffer.as_mut().align_to_mut::<u32>() };
                 let max_words = usize::try_from(io_size / (size_of::<u32>() as u64))?;
-                let fill_buffer_len = min(fill_buffer.len(), max_words);
+                let fill_buffer_len =
+                    min(min(fill_buffer.len(), max_words), MAX_FILL_CHUNK_SIZE / size_of::<u32>());
                 let fill_buffer = &mut fill_buffer[..fill_buffer_len];
 
                 fill_buffer.fill(*payload);
@@ -429,6 +527,8 @@ where
     tasks: &'d Shared<C>,
     current_download_buffer: Option<ScopedBuffer<'b, P>>,
     current_download_size: usize,
+    // CRC32 of the current download, computed while it was received.
+    current_download_crc: Option<u32>,
     enable_async_task: bool,
     expected_download_crc: Option<u32>,
     default_block: Option<usize>,
@@ -439,6 +539,7 @@ where
     result: GblFastbootResult,
     async_info_sent: bool,
     pending_misc_task: bool,
+    data_command_log: DataCommandLog,
     // Introduces marker type so that we can enforce constraint 'd <= min('b, 'c).
     // The constraint is expressed in the implementation block for the `FastbootImplementation`
     // trait.
@@ -507,6 +608,7 @@ where
             buffer_pool,
             current_download_buffer: None,
             current_download_size: 0,
+            current_download_crc: None,
             enable_async_task: false,
             expected_download_crc: None,
             default_block: None,
@@ -516,6 +618,7 @@ where
             result: Default::default(),
             async_info_sent: false,
             pending_misc_task: false,
+            data_command_log: Default::default(),
             _tasks_context_lifetime: PhantomData,
         };
         Self { gbl_ops, state }
@@ -528,6 +631,13 @@ where
         &self,
     ) -> &'d Shared<impl PinFutContainerTyped<'c, F> + use<'c, G, B, P2, T, P, C, F>> {
         self.state.tasks
+    }
+
+    /// Logs the summary of the data commands that `log_command()` counted instead of logging.
+    fn flush_data_command_log(&mut self) {
+        if let Some(log) = self.state.data_command_log.take() {
+            gbl_println!(self.gbl_ops, "Fastboot Command: ... and {log}");
+        }
     }
 
     /// Listens on the given transports and TCP channels and runs fastboot.
@@ -563,7 +673,8 @@ where
                         match process_next_command(t, self).await {
                             Ok(true) => break 'outer,
                             Err(e) => {
-                                gbl_println!(self.gbl_ops, "GBL Fastboot transport error: {e}")
+                                self.flush_data_command_log();
+                                gbl_println!(self.gbl_ops, "GBL Fastboot transport error: {e}");
                             }
                             _ => (),
                         };
@@ -575,7 +686,9 @@ where
                 {
                     // Enable trace when actually doing useful work.
                     let _guard = TraceGuard::new(trace_config_orig);
-                    match v.run_session(self).await {
+                    let res = v.run_session(self).await;
+                    self.flush_data_command_log();
+                    match res {
                         Ok(()) => break 'outer,
                         Err(e) if e != fastboot::Error::Disconnected => {
                             gbl_println!(self.gbl_ops, "GBL Fastboot TCP session error: {e}");
@@ -1079,25 +1192,27 @@ where
                 self.write_cancelled_virtual_ab_msg(gbl_ops, msg).await?;
             }
         }
-        match self.enable_async_task {
-            true => {
-                // `add_with` requires that the closure is lazily evaluated. If task cannot be
-                // added, it must not be evaluated.
-                self.tasks.borrow_mut().add_with(|| (self.task_mapper)(take(task)));
+        if self.enable_async_task {
+            // `add_with` requires that the closure is lazily evaluated. If task cannot be
+            // added, it must not be evaluated.
+            self.tasks.borrow_mut().add_with(|| (self.task_mapper)(take(task)));
+            if !task.is_none() {
+                let _wait_guard = WaitingForAsyncTasksGuard::new();
                 while !task.is_none() {
                     yield_now().await;
                     self.tasks.borrow_mut().add_with(|| (self.task_mapper)(take(task)));
                 }
-
-                self.tasks.borrow_mut().poll_all();
-                if !self.async_info_sent {
-                    let info = "Launched async task. Run \"oem gbl-sync-tasks\" to sync.";
-                    responder.send_info(info).await?;
-                    self.async_info_sent = true;
-                }
             }
-            _ => task.run_checked().await?,
-        };
+
+            self.tasks.borrow_mut().poll_all();
+            if !self.async_info_sent {
+                let info = "Launched async task. Run \"oem gbl-sync-tasks\" to sync.";
+                responder.send_info(info).await?;
+                self.async_info_sent = true;
+            }
+        } else {
+            task.run_checked().await?;
+        }
         Ok(())
     }
 
@@ -1121,6 +1236,7 @@ where
         tag: &str,
     ) {
         let mut num_tasks = 0;
+        let mut wait_guard = None;
         loop {
             let new_num_tasks = self.tasks.borrow_mut().poll_all();
             if new_num_tasks == 0 {
@@ -1140,6 +1256,10 @@ where
                 }
                 num_tasks = new_num_tasks;
             }
+            // Once the initial INFO status has been sent, no bulk download is active until all
+            // tasks finish, so allow synchronous storage backends to drain remaining writes at full
+            // unchunked speed.
+            wait_guard.get_or_insert_with(WaitingForAsyncTasksGuard::new);
             yield_now().await;
         }
     }
@@ -1646,15 +1766,35 @@ where
     }
 
     /// Takes the download data and resets the download size.
+    ///
+    /// Returns `None` if there is no download, e.g. because the last one failed.
     fn take_download(&mut self) -> Option<(ScopedBuffer<'b, P>, usize)> {
-        Some((self.current_download_buffer.take()?, take(&mut self.current_download_size)))
+        self.take_download_with_crc().map(|(data, size, _)| (data, size))
+    }
+
+    /// Same as [Self::take_download] but also returns the CRC32 of the download if it is known.
+    fn take_download_with_crc(&mut self) -> Option<(ScopedBuffer<'b, P>, usize, Option<u32>)> {
+        // Downloads are never empty, so a zero size means that there is no download.
+        if self.current_download_size == 0 {
+            return None;
+        }
+        let data = self.current_download_buffer.take()?;
+        let crc = self.current_download_crc.take();
+        Some((data, take(&mut self.current_download_size), crc))
     }
 
     /// Gets or allocates a download buffer and returns it by value.
+    ///
+    /// Any current download is discarded.
     async fn take_or_allocate_download_buffer(&mut self) -> ScopedBuffer<'b, P> {
+        self.current_download_size = 0;
+        self.current_download_crc = None;
         if let Some(buf) = self.current_download_buffer.take() {
             buf
+        } else if let Some(buf) = self.buffer_pool.allocate() {
+            buf
         } else {
+            let _wait_guard = WaitingForAsyncTasksGuard::new();
             self.buffer_pool.allocate_async().await
         }
     }
@@ -1664,7 +1804,10 @@ where
         let current = &mut self.current_download_buffer;
         if let Some(buf) = current {
             buf
+        } else if let Some(buf) = self.buffer_pool.allocate() {
+            current.insert(buf)
         } else {
+            let _wait_guard = WaitingForAsyncTasksGuard::new();
             current.insert(self.buffer_pool.allocate_async().await)
         }
     }
@@ -1886,9 +2029,11 @@ where
         let (part_io, fdr, snapshot_cancel) =
             self.state.parse_and_get_partition_io::<ReadWrite>(self.gbl_ops, part).await?;
         let (data, sz) = self.state.take_download().ok_or("No download")?;
+        // Only the first `sz` bytes are downloaded data. The rest of the buffer holds stale data,
+        // e.g. from an earlier download.
         let mut task = Task::new(
-            match is_sparse_image(&data) {
-                Ok(v) => TaskWorkload::FlashSparse(part_io.sub(0, v.data_size())?, data),
+            match is_sparse_image(&data[..sz]) {
+                Ok(v) => TaskWorkload::FlashSparse(part_io.sub(0, v.data_size())?, data, sz),
                 _ => TaskWorkload::Flash(part_io.sub(0, sz.try_into().unwrap())?, data, sz),
             },
             |f| write!(f, "flash:{part}"),
@@ -1931,64 +2076,57 @@ where
         &mut self,
         responder: impl DownloadBuilder + InfoSender,
     ) -> CommandResult<()> {
+        // The download overwrites the buffer of the current download, so discard the current one
+        // first: if this download fails, no later command may use a mix of old and new data.
+        self.state.current_download_size = 0;
+        self.state.current_download_crc = None;
+        let expected_crc = self.state.expected_download_crc.take();
         self.state.get_download_buffer().await;
         let Self { gbl_ops, state } = self;
         let buf = &mut state.current_download_buffer.as_mut().unwrap()[..];
-        let total = responder.total();
-        if total > buf.len() {
-            return Err(GblFastbootError::BufferTooSmall { size: buf.len(), needed: total });
+        let res = async {
+            let total = responder.total();
+            if total > buf.len() {
+                return Err(GblFastbootError::BufferTooSmall { size: buf.len(), needed: total });
+            }
+
+            let mut downloader = responder.initiate_download().await?;
+            let channel = DataChannel::default();
+            // Computes the CRC32 of the data while it arrives, so that commands that verify it,
+            // e.g. `stream-flash`, don't need another pass over the data after the download.
+            let (dl, crc) =
+                join(download(&mut downloader, buf, &channel), download_crc32(&channel)).await;
+            dl?;
+            let crc = crc?;
+            if let Some(expected) = expected_crc
+                && expected != crc
+            {
+                return Err(GblFastbootError::CrcMismatch { expected, actual: crc });
+            }
+
+            // Logs large downloads once all data is in: printing to a slow console while data
+            // arrives would stall the network.
+            if total >= LOG_DOWNLOAD_MIN_SIZE {
+                gbl_println!(gbl_ops, "\tDownloaded {total} bytes");
+            }
+            Ok::<_, GblFastbootError>((total, crc))
         }
+        .await;
 
-        let mut downloader = responder.initiate_download().await?;
-        let channel = DataChannel::default();
-
-        // CRC computation task.
-        let crc = async {
-            let Some(crc) = state.expected_download_crc.take() else {
-                return Ok(());
-            };
-            let mut hasher = crc32fast::Hasher::new();
-            while let Some(v) = channel.read().await? {
-                // GBL's native TCP stack requires active CPU cycles to process incoming frames.
-                // Hashing too much data causes ACK delay and increases retransmission rate which
-                // significantly impacts download speed. Thus we yield after processing a moderate
-                // amount. 4K is chosen empirically.
-                //
-                // Other media such as USB where hardware is capable of delivering final data is
-                // not affected and as effective as without.
-                for v in v.chunks(4 * 1024) {
-                    hasher.update(v);
-                    yield_now().await;
-                }
+        match res {
+            Ok((size, crc)) => {
+                self.state.current_download_size = size;
+                self.state.current_download_crc = Some(crc);
+                Ok(())
             }
-            let actual = hasher.finalize();
-            if actual != crc {
-                return Err(GblFastbootError::CrcMismatch { expected: crc, actual });
+            Err(e) => {
+                // Releases the partially overwritten buffer.
+                self.state.current_download_buffer = None;
+                self.flush_data_command_log();
+                gbl_println!(self.gbl_ops, "Fastboot download failed: {e}");
+                Err(e)
             }
-            Ok::<(), GblFastbootError>(())
-        };
-
-        // Progress logging task.
-        let log = async {
-            let _guard = TraceGuard::new(false);
-            if total < 128 * 1024 * 1024 {
-                return Ok(());
-            }
-            let recv = || channel.remaining().map(|v| total - v);
-            for i in 0..5 {
-                while recv()? * 4 / total < i {
-                    yield_now().await;
-                }
-                gbl_println!(gbl_ops, "\tDownloaded {}+%, {}/{total}", 25 * i, recv()?);
-            }
-            Ok::<(), Error>(())
-        };
-
-        let ((dl, crc), _) = join(join(download(&mut downloader, buf, &channel), crc), log).await;
-        dl?;
-        crc?;
-        state.current_download_size = total;
-        Ok(())
+        }
     }
 
     async fn upload(&mut self, responder: impl UploadBuilder + InfoSender) -> CommandResult<()> {
@@ -2030,7 +2168,7 @@ where
         if fdr != Fdr::No || !matches!(snapshot_cancel, SnapshotMergeCancel::None) {
             return Err("Internal error: write side-effects requested during fetch".into());
         }
-        let buffer = self.state.get_download_buffer().await;
+        let mut buffer = self.state.take_or_allocate_download_buffer().await;
         // 4MB batches (chosen empirically) or as large as the download buffer permits.
         let batch_sz = min(4 * 1024 * 1024, buffer.len() / 2);
         let (mut read_buf, mut send_buf) = buffer.split_at_mut(batch_sz);
@@ -2225,46 +2363,69 @@ where
         command: StreamCommand<&str>,
         mut responder: impl InfoSender,
     ) -> CommandResult<()> {
-        self.state.check_unlocked(self.gbl_ops)?;
-        let (part_io, fdr, snapshot_cancel) = self
-            .state
-            .parse_and_get_partition_io::<ReadWrite>(self.gbl_ops, command.partition.as_ref())
-            .await?;
-        let mut task = match command.operation {
-            StreamOperation::Fill { size, payload } => {
-                let io = part_io.sub(command.offset, size)?;
-                let buffer = self.state.take_or_allocate_download_buffer().await;
-                Task::new(TaskWorkload::Fill(io, buffer, payload), |f| {
-                    write!(f, "stream-fill:{}:{:#x}:{:#x}", command.partition, command.offset, size)
-                })
-            }
-            StreamOperation::Flash { checksum } => {
-                let (download, size) = self.state.take_download().ok_or("No downloaded data")?;
-                let io = part_io.sub(command.offset, size.try_into()?)?;
-                let mut hasher = crc32fast::Hasher::new();
-                for v in download[..size].chunks(KiB!(4)) {
-                    hasher.update(v);
-                    yield_now().await;
+        let res = async {
+            self.state.check_unlocked(self.gbl_ops)?;
+            let (part_io, fdr, snapshot_cancel) = self
+                .state
+                .parse_and_get_partition_io::<ReadWrite>(self.gbl_ops, command.partition.as_ref())
+                .await?;
+            let mut task = match command.operation {
+                StreamOperation::Fill { size, payload } => {
+                    let io = part_io.sub(command.offset, size)?;
+                    // Release any idle or staged download buffer back to `buffer_pool`; the fill
+                    // task allocates its scratch buffer lazily once it reaches the head of the
+                    // task queue.
+                    self.state.current_download_buffer = None;
+                    self.state.current_download_size = 0;
+                    self.state.current_download_crc = None;
+                    Task::new(TaskWorkload::Fill(io, self.state.buffer_pool, payload), |f| {
+                        write!(
+                            f,
+                            "stream-fill:{}:{:#x}:{:#x}",
+                            command.partition, command.offset, size
+                        )
+                    })
                 }
-                let actual = hasher.finalize();
-                if actual != checksum {
-                    return Err(GblFastbootError::ChecksumMismatch { expected: checksum, actual });
+                StreamOperation::Flash { checksum } => {
+                    let (download, size, crc) =
+                        self.state.take_download_with_crc().ok_or("No downloaded data")?;
+                    let io = part_io.sub(command.offset, size.try_into()?)?;
+                    match crc {
+                        Some(actual) if actual != checksum => {
+                            return Err(GblFastbootError::ChecksumMismatch {
+                                expected: checksum,
+                                actual,
+                            });
+                        }
+                        Some(_) => {}
+                        None => verify_stream_crc32(&download[..size], checksum).await?,
+                    }
+                    Task::new(TaskWorkload::Flash(io, download, size), |f| {
+                        write!(
+                            f,
+                            "stream-flash:{}:{:#x}:{:#x}",
+                            command.partition, command.offset, size
+                        )
+                    })
                 }
-                Task::new(TaskWorkload::Flash(io, download, size), |f| {
-                    write!(
-                        f,
-                        "stream-flash:{}:{:#x}:{:#x}",
-                        command.partition, command.offset, size
-                    )
-                })
-            }
-        };
+            };
 
-        self.state.schedule_task(self.gbl_ops, &mut task, snapshot_cancel, &mut responder).await?;
-        if fdr == Fdr::Yes {
-            self.state.sync_tasks_and_fdr(self.gbl_ops, &mut responder).await?;
+            self.state
+                .schedule_task(self.gbl_ops, &mut task, snapshot_cancel, &mut responder)
+                .await?;
+            if fdr == Fdr::Yes {
+                self.state.sync_tasks_and_fdr(self.gbl_ops, &mut responder).await?;
+            }
+            Ok::<_, GblFastbootError>(())
         }
-        Ok(())
+        .await;
+        if let Err(e) = &res {
+            // Stream commands are not logged one by one (see `log_command()`), so flush the run
+            // summary first and then log the failure.
+            self.flush_data_command_log();
+            gbl_println!(self.gbl_ops, "Fastboot stream command failed: {command:?}: {e}");
+        }
+        res
     }
 
     async fn boot(&mut self, resp: impl InfoSender + OkaySender) -> CommandResult<()> {
@@ -2353,12 +2514,18 @@ where
             .current_download_buffer
             .as_ref()
             .map_or(0, |_| self.state.current_download_size);
+        // `fastboot_command_exec` takes `&mut [u8]`; invalidate the cached CRC if a custom
+        // implementation handles the command (or fails) after potentially mutating the buffer.
         let res = self.gbl_ops.fastboot_command_exec(
             args.clone(),
             self.state.current_download_buffer.as_mut().map_or(&mut [][..], |v| &mut v[..]),
             current_download_size,
             responder,
-        )?;
+        );
+        if !matches!(res, Ok(CommandExecType::DefaultImpl)) {
+            self.state.current_download_crc = None;
+        }
+        let res = res?;
         if matches!(res, CommandExecType::CustomImpl)
             && [Some(c"flash"), Some(c"erase")].contains(&args.next())
         {
@@ -2369,6 +2536,18 @@ where
 
     fn log_line(&mut self, message: impl Display) {
         gbl_println!(self.gbl_ops, "{}", message);
+    }
+
+    fn log_command(&mut self, cmd: &str) {
+        // A streaming or sparse flash sends dozens of data commands in a row. At ~5 ms per line on
+        // a 115200 baud serial console, logging each of them would take longer than running many
+        // of them, so only the first one of a run is logged and the rest are summarized.
+        if self.state.data_command_log.add(cmd) {
+            return;
+        }
+        self.flush_data_command_log();
+        gbl_println!(self.gbl_ops, "Fastboot Command: {cmd}");
+        self.state.data_command_log.start(cmd);
     }
 }
 
@@ -2449,8 +2628,6 @@ struct DataChannelInternal<'a> {
     // Completed: Some(Ok(<unread data>))
     // Failed: Some(Err(_))
     result: Option<Result<&'a mut [u8], Error>>,
-    // Remaining data from the download
-    remaining: usize,
 }
 
 /// `DataChannel` contains shared state and buffer for async code to read and download data in
@@ -2475,14 +2652,36 @@ impl<'a> DataChannel<'a> {
             yield_now().await;
         }
     }
+}
 
-    // Returns the remaining size of data from the download.
-    fn remaining(&self) -> Result<usize, Error> {
-        if let Some(Err(e)) = self.0.borrow().result.as_ref() {
-            return Err(*e);
+/// Computes the CRC32 of the data streamed over `channel` during `download`.
+async fn download_crc32(channel: &DataChannel<'_>) -> CommandResult<u32> {
+    let mut hasher = crc32fast::Hasher::new();
+    while let Some(v) = channel.read().await? {
+        // Yields between chunks so that the network keeps being serviced. Other media such as USB,
+        // where hardware delivers the data, are not affected.
+        for v in v.chunks(CRC_CHUNK_SIZE) {
+            hasher.update(v);
+            yield_now().await;
         }
-        Ok(self.0.borrow().remaining)
     }
+    Ok(hasher.finalize())
+}
+
+/// Verifies the mandatory CRC32 checksum of a `stream:flash` payload.
+///
+/// Only needed if the CRC32 of the download is unknown: `download` computes it while receiving.
+async fn verify_stream_crc32(data: &[u8], expected: u32) -> CommandResult<()> {
+    let mut hasher = crc32fast::Hasher::new();
+    for v in data.chunks(CRC_CHUNK_SIZE) {
+        hasher.update(v);
+        yield_now().await;
+    }
+    let actual = hasher.finalize();
+    if actual != expected {
+        return Err(GblFastbootError::ChecksumMismatch { expected, actual });
+    }
+    Ok(())
 }
 
 /// Download data to the given buffer until either the buffer is filled or download is complete.
@@ -2502,10 +2701,8 @@ async fn download<'a>(
         let mut to_download = &mut buffer[..sz];
         let mut downloaded;
         let mut curr = 0;
-        channel.0.borrow_mut().remaining = downloader.remaining();
         while curr < to_download.len() {
             curr += downloader.download(&mut to_download[curr..]).await?;
-            channel.0.borrow_mut().remaining = downloader.remaining();
             if matches!(channel.0.borrow_mut().request, Some(Request::Pending)) {
                 (downloaded, to_download) = to_download.split_at_mut(take(&mut curr));
                 channel.0.borrow_mut().request = Some(Request::Ready(downloaded));
@@ -2798,9 +2995,14 @@ pub(crate) mod test {
             &mut self,
             mut cb: impl FnMut(&mut Pin<&mut (dyn Future<Output = ()> + 'a)>, &mut FutContext) -> bool,
         ) {
-            for idx in (0..self.len()).rev() {
+            let mut idx = 0;
+            while idx < self.len() {
                 let (f, b) = &mut self[idx];
-                cb(&mut f.as_mut(), b).then(|| self.swap_remove(idx));
+                if cb(&mut f.as_mut(), b) {
+                    drop(self.remove(idx));
+                } else {
+                    idx += 1;
+                }
             }
         }
     }
@@ -9115,9 +9317,9 @@ pub(crate) mod test {
                     b"erase:userdata/1/0/0x4",
                     b"stream-fill:userdata:0:0x4:0x12345678",
                     b"stream-fill:cache:0:0x4:0x12345678",
-                    // Read-only fetch and flashing other partitions remain allowed.
-                    b"fetch:userdata:0:0x4",
+                    // Flashing other partitions and read-only fetch remain allowed.
                     b"flash:boot_a",
+                    b"fetch:userdata:0:0x4",
                     // Canceling the snapshot merge unblocks userdata/metadata/misc/FDR partitions.
                     b"snapshot-update:cancel",
                     b"erase:userdata",
@@ -9140,10 +9342,10 @@ pub(crate) mod test {
                     b"FAILCannot flash/erase partition while a snapshot update is in progress",
                     b"FAILCannot flash/erase partition while a snapshot update is in progress",
                     b"FAILCannot flash/erase partition while a snapshot update is in progress",
+                    b"OKAY",
                     b"INFOUploading 4 bytes...",
                     b"DATA00000004",
                     &[0xaa; 4],
-                    b"OKAY",
                     b"OKAY",
                     b"OKAY",
                     b"OKAY",
@@ -9944,6 +10146,294 @@ pub(crate) mod test {
             !gbl_ops.console_logs.contains("Warning: unusable Virtual A/B metadata in misc"),
             "unexpected Virtual A/B guard warning on Fuchsia: {:?}",
             gbl_ops.console_logs
+        );
+    }
+
+    #[test]
+    fn test_failed_download_invalidates_previous_download() {
+        let mut storage = FakeGblOpsStorage::default();
+        storage.add_raw_device(c"boot_a", [0u8; KiB!(4)]);
+        let buffers = vec![Some(vec![0u8; KiB!(2)]); 1];
+        let mut gbl_ops = FakeGblOps::new(&storage);
+        gbl_ops.avb_device_status.is_unlocked = true;
+        let listener: SharedTestListener = Default::default();
+        let (transports, tcp) = (&mut [&listener], &listener);
+
+        // First download succeeds.
+        listener.add_transport_input(b"download:0x800");
+        listener.add_transport_input(&[0x55u8; KiB!(2)]);
+        // Second download overwrites part of the buffer and then fails CRC verification.
+        listener.add_transport_input(b"oem gbl-set-download-crc 0xdeadbeef");
+        listener.add_transport_input(b"download:0x400");
+        listener.add_transport_input(&[0xaau8; KiB!(1)]);
+        // Subsequent flash and stream-flash must reject the invalidated download.
+        listener.add_transport_input(b"flash:boot_a");
+        listener.add_transport_input(b"stream-flash:boot_a:0:0xb47c63c1");
+        listener.add_transport_input(b"continue");
+
+        let mut general = vec![0u8; 1024];
+        block_on(run_gbl_fastboot_stack::<2>(
+            &mut gbl_ops,
+            buffers,
+            transports,
+            Some(tcp),
+            GblFbData { boot_buffer: (&mut general[..]).into(), ..Default::default() },
+        ));
+
+        assert_eq!(
+            listener.transport_out_queue(),
+            make_expected_transport_out(&[
+                b"DATA00000800",
+                b"OKAY",
+                b"OKAY",
+                b"DATA00000400",
+                b"FAILCRC check failed. expected: 0xdeadbeef, actual: 0x3c6f327d",
+                b"FAILNo download",
+                b"FAILNo downloaded data",
+                b"OKAY",
+            ]),
+            "\nActual Transport output:\n{}",
+            listener.dump_transport_out_queue()
+        );
+        assert_eq!(
+            storage[0].partition_io(None).unwrap().dev().io().storage().deref(),
+            [0u8; KiB!(4)]
+        );
+    }
+
+    #[test]
+    fn test_fetch_discards_previous_download_and_releases_buffer() {
+        let mut storage = FakeGblOpsStorage::default();
+        storage.add_raw_device(c"boot_a", [0x77u8; KiB!(4)]);
+        storage.add_raw_device(c"boot_b", [0u8; KiB!(4)]);
+        let dl_buffers = Shared::from(vec![Some(vec![0u8; KiB!(2)]); 1]);
+        let mut gbl_ops = FakeGblOps::new(&storage);
+        gbl_ops.avb_device_status.is_unlocked = true;
+        let tasks = vec![].into();
+        let parts = gbl_ops.disks();
+        let mut gbl_fb = GblFastboot::new(
+            &mut gbl_ops,
+            parts,
+            Task::run,
+            &tasks,
+            &dl_buffers,
+            Default::default(),
+        );
+        let resp: TestResponder = Default::default();
+
+        set_download(&mut gbl_fb, &[0x11u8; 512]);
+        assert_eq!(fetch(&mut gbl_fb, "boot_a".into(), 0, 512).unwrap(), [0x77u8; 512]);
+        // Pool buffer was returned on `fetch` exit, and the overwritten download was discarded.
+        assert!(dl_buffers.allocate().is_some());
+        assert_eq!(block_on(gbl_fb.flash("boot_b", &resp)), Err("No download".into()));
+    }
+
+    #[test]
+    fn test_flash_sparse_ignores_trailing_buffer_garbage() {
+        let sparse_raw = include_bytes!("../../testdata/sparse_test_raw.bin");
+        let sparse = include_bytes!("../../testdata/sparse_test.bin");
+        let mut storage = FakeGblOpsStorage::default();
+        storage.add_raw_device(c"sparse", vec![0u8; sparse_raw.len()]);
+        // Pre-fill the larger download buffer with non-zero bytes so trailing bytes past `sparse`
+        // would corrupt parsing if not sliced to `&data[..sz]`.
+        let dl_buffers = Shared::from(vec![Some(vec![0xffu8; sparse.len() + KiB!(8)]); 1]);
+        let mut gbl_ops = FakeGblOps::new(&storage);
+        gbl_ops.avb_device_status.is_unlocked = true;
+        let tasks = vec![].into();
+        let parts = gbl_ops.disks();
+        let mut gbl_fb = GblFastboot::new(
+            &mut gbl_ops,
+            parts,
+            Task::run,
+            &tasks,
+            &dl_buffers,
+            Default::default(),
+        );
+        let resp: TestResponder = Default::default();
+
+        set_download(&mut gbl_fb, sparse);
+        assert_eq!(block_on(gbl_fb.flash("sparse", &resp)), Ok(()));
+        assert_eq!(fetch(&mut gbl_fb, "sparse".into(), 0, sparse_raw.len()).unwrap(), sparse_raw);
+    }
+
+    #[test]
+    fn test_data_command_log_summarizes_runs() {
+        let mut log = DataCommandLog::default();
+        assert!(!log.add("download:0x1000"));
+        assert!(log.take().is_none());
+
+        log.start("download:0x1000");
+        assert!(log.add("stream-flash:fvm:0x0:0x1234"));
+        assert!(log.add("stream-fill:fvm:0x1000:0x2000:0x0"));
+        assert!(log.add("download:0x1000"));
+        assert!(log.add("stream-flash:fvm:0x3000:0x5678"));
+        assert!(!log.add("getvar:version"));
+
+        let summary = log.take().unwrap();
+        assert_eq!(summary.to_string(), "4 more: download x1, stream-flash x2, stream-fill x1");
+        assert!(log.take().is_none());
+    }
+
+    #[test]
+    fn test_async_stream_flash_fill_does_not_starve_concurrent_download() {
+        let mut storage = FakeGblOpsStorage::default();
+        storage.add_gpt_device(include_bytes!("../../../libstorage/test/gpt_test_1.bin"));
+        storage[0].get_blk_io().set_blocking(true);
+        let dl_buffers = Shared::from(vec![Some(vec![0u8; KiB!(2)]); 2]);
+        let mut gbl_ops = FakeGblOps::new(&storage);
+        gbl_ops.avb_device_status.is_unlocked = true;
+        let tasks = vec![].into();
+        let parts = gbl_ops.disks();
+        let mut gbl_fb = GblFastboot::new(
+            &mut gbl_ops,
+            parts,
+            Task::run,
+            &tasks,
+            &dl_buffers,
+            Default::default(),
+        );
+        let tasks = gbl_fb.tasks();
+        let resp: TestResponder = Default::default();
+
+        // Querying max-download-size must not hoard a pool buffer.
+        assert_eq!(block_on(gbl_fb.state.max_download_size()), KiB!(2));
+        {
+            let b0 = dl_buffers.allocate();
+            let b1 = dl_buffers.allocate();
+            assert!(b0.is_some() && b1.is_some());
+        }
+
+        block_on(oem(&mut gbl_fb, "gbl-enable-async-task", &resp)).unwrap();
+
+        // Queue async `stream-flash` (takes buffer #0) followed immediately by `stream-fill`.
+        let chunk1 = [0x55u8; KiB!(2)];
+        let crc1 = crc32fast::hash(&chunk1);
+        set_download(&mut gbl_fb, &chunk1);
+        let flash_cmd = format!("stream-flash:boot_a:0:{crc1:#x}");
+        block_on(gbl_fb.stream(flash_cmd.as_str().try_into().unwrap(), &resp)).unwrap();
+
+        let fill_cmd = "stream-fill:boot_a:0x800:0x800:0xF005500F";
+        block_on(gbl_fb.stream(fill_cmd.try_into().unwrap(), &resp)).unwrap();
+
+        // Buffer #1 must remain free so the next `download` can overlap with disk I/O!
+        {
+            let concurrent_dl_buf = dl_buffers.allocate();
+            assert!(
+                concurrent_dl_buf.is_some(),
+                "Queued stream-fill must not claim the second download buffer while stream-flash is still running"
+            );
+        }
+
+        tasks.borrow_mut().run();
+        assert_eq!(fetch(&mut gbl_fb, "boot_a".into(), 0, KiB!(2)).unwrap(), chunk1);
+        assert_eq!(
+            fetch(&mut gbl_fb, "boot_a".into(), KiB!(2), KiB!(2)).unwrap(),
+            [0xF005500Fu32; KiB!(2) / size_of::<u32>()].as_bytes()
+        );
+    }
+
+    #[test]
+    fn test_custom_command_exec_invalidates_cached_download_crc() {
+        let mut storage = FakeGblOpsStorage::default();
+        storage.add_raw_device(c"boot_a", [0u8; KiB!(4)]);
+        let buffers = vec![Some(vec![0u8; KiB!(2)]); 1];
+        let mut handler = |cmd: Vec<String>, download: &mut [u8], download_used: usize| {
+            if cmd == ["oem mutate-download"] {
+                download[..download_used].fill(0xbb);
+                Ok(CommandExecType::CustomImpl)
+            } else {
+                Ok(CommandExecType::DefaultImpl)
+            }
+        };
+        let mut gbl_ops = FakeGblOps::new(&storage);
+        gbl_ops.avb_device_status.is_unlocked = true;
+        gbl_ops.fastboot_command_exec_handler = Some(&mut handler);
+
+        let orig = [0xaau8; KiB!(1)];
+        let mutated = [0xbbu8; KiB!(1)];
+        let orig_crc = crc32fast::hash(&orig);
+        let mutated_crc = crc32fast::hash(&mutated);
+
+        let listener: SharedTestListener = Default::default();
+        let (transports, tcp) = (&mut [&listener], &listener);
+        // 1. Download `orig`, mutate via custom command, then try `stream-flash` with stale CRC.
+        listener.add_transport_input(b"download:0x400");
+        listener.add_transport_input(&orig);
+        listener.add_transport_input(b"oem mutate-download");
+        listener.add_transport_input(format!("stream-flash:boot_a:0:{orig_crc:#x}").as_bytes());
+        // 2. Download `orig`, mutate via custom command, then `stream-flash` with mutated CRC.
+        listener.add_transport_input(b"download:0x400");
+        listener.add_transport_input(&orig);
+        listener.add_transport_input(b"oem mutate-download");
+        listener.add_transport_input(format!("stream-flash:boot_a:0:{mutated_crc:#x}").as_bytes());
+        listener.add_transport_input(b"continue");
+
+        block_on(run_gbl_fastboot_stack::<2>(
+            &mut gbl_ops,
+            buffers,
+            transports,
+            Some(tcp),
+            Default::default(),
+        ));
+
+        let expected_fail =
+            format!("FAILChecksum mismatch: expected {orig_crc:#x}, got {mutated_crc:#x}");
+        assert_eq!(
+            listener.transport_out_queue(),
+            make_expected_transport_out(&[
+                b"DATA00000400",
+                b"OKAY",
+                b"OKAY",
+                expected_fail.as_bytes(),
+                b"DATA00000400",
+                b"OKAY",
+                b"OKAY",
+                b"OKAY",
+                b"OKAY",
+            ]),
+            "\nActual Transport output:\n{}",
+            listener.dump_transport_out_queue()
+        );
+        assert_eq!(
+            &storage[0].partition_io(None).unwrap().dev().io().storage().deref()[..KiB!(1)],
+            &mutated[..]
+        );
+    }
+
+    #[test]
+    fn test_error_paths_flush_data_command_log() {
+        let mut storage = FakeGblOpsStorage::default();
+        storage.add_raw_device(c"boot_a", [0u8; KiB!(4)]);
+        let dl_buffers = Shared::from(vec![Some(vec![0u8; KiB!(2)]); 1]);
+        let mut gbl_ops = FakeGblOps::new(&storage);
+        gbl_ops.avb_device_status.is_unlocked = true;
+        let tasks = vec![].into();
+        let parts = gbl_ops.disks();
+        let mut gbl_fb = GblFastboot::new(
+            &mut gbl_ops,
+            parts,
+            Task::run,
+            &tasks,
+            &dl_buffers,
+            Default::default(),
+        );
+        let resp: TestResponder = Default::default();
+
+        // Simulate a run of suppressed data commands followed by a failing `stream` command.
+        gbl_fb.log_command("download:0x800");
+        gbl_fb.log_command("stream-fill:boot_a:0x0:0x800:0x0");
+        gbl_fb.log_command("stream-flash:missing_part:0x0:0x0");
+        assert!(
+            gbl_fb.state.data_command_log.stream_fill == 1
+                && gbl_fb.state.data_command_log.stream_flash == 1
+        );
+        assert!(block_on(
+            gbl_fb.stream("stream-flash:missing_part:0x0:0x0".try_into().unwrap(), &resp)
+        )
+        .is_err());
+        assert!(
+            gbl_fb.state.data_command_log.take().is_none(),
+            "stream() error path must flush data_command_log before logging the failure"
         );
     }
 }

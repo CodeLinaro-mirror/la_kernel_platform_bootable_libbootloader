@@ -533,7 +533,14 @@ where
 
     /// Gets the max-download-size variable.
     pub(crate) async fn max_download_size(&mut self) -> usize {
-        self.get_download_buffer().await.len()
+        if let Some(buf) = &self.current_download_buffer {
+            buf.len()
+        } else if let Some(buf) = self.buffer_pool.allocate() {
+            buf.len()
+        } else {
+            let _wait_guard = super::WaitingForAsyncTasksGuard::new();
+            self.buffer_pool.allocate_async().await.len()
+        }
     }
 
     /// Parses and finds the size of the given partition.

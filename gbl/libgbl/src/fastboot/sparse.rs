@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::MAX_FILL_CHUNK_SIZE;
 use core::{
     cmp::{max, min},
     mem::size_of,
@@ -51,7 +52,7 @@ impl SparseHeader {
 }
 
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, FromBytes, IntoBytes)]
+#[derive(Copy, Clone, Debug, Default, Immutable, FromBytes, IntoBytes)]
 pub struct ChunkHeader {
     pub chunk_type: u16,
     pub reserved1: u16,
@@ -135,21 +136,25 @@ pub(crate) trait SparseRawWriter {
     async fn write(&mut self, off: u64, data: &mut [u8]) -> Result<(), Error>;
 }
 
-/// Write a sparse image in `sparse_img`.
+/// Writes a sparse image in `buf[..img_size]`, using the full `buf` as fill scratch.
 ///
 /// # Args
 ///
-/// * `sparse_img`: The input buffer containing the sparse image. The API modifes input buffer for
-///   internal optimization.
+/// * `buf`: Buffer whose `buf[..img_size]` prefix contains the sparse image. Pass 2 reuses the
+///   remainder of `buf` past the `FillInfo` table as its fill scratch buffer so compact fill-heavy
+///   sparse images still write large chunks rather than tiny slices.
+/// * `img_size`: Size in bytes of the sparse image in `buf`.
 /// * `writer`: An implementation of `SparseRawWriter`.
 ///
 /// # Returns
 ///
 /// Returns the total number of bytes written, including don't care chunks.
 pub async fn write_sparse_image(
-    sparse_img: &mut [u8],
+    buf: &mut [u8],
+    img_size: usize,
     writer: &mut impl SparseRawWriter,
 ) -> Result<u64, Error> {
+    let sparse_img = get_mut(buf, 0, img_size)?;
     let sparse_header: SparseHeader = is_sparse_image(sparse_img)?;
     let mut curr: usize = size_of::<SparseHeader>();
     let mut write_offset = 0u64;
@@ -157,8 +162,9 @@ pub async fn write_sparse_image(
     // First pass. Writes non-fill chunk and constructs `FillInfo`.
     let mut fill_off = 0usize;
     for _ in 0..sparse_header.total_chunks {
-        let header: ChunkHeader = copy_from(&sparse_img[curr..])?;
-        let payload = &mut sparse_img[curr + size_of::<ChunkHeader>()..];
+        let header: ChunkHeader = copy_from(get(sparse_img, curr, sparse_img.len())?)?;
+        let next_curr = usize_add(curr, header.total_sz)?;
+        let payload = get_mut(sparse_img, usize_add(curr, size_of::<ChunkHeader>())?, next_curr)?;
         let payload_sz = u64_mul(header.chunk_sz, sparse_header.blk_sz)?;
         let mut fill = FillInfo::new_skip(header.chunk_sz);
         match header.chunk_type {
@@ -180,13 +186,13 @@ pub async fn write_sparse_image(
         }
         sparse_img[fill_off..][..size_of::<FillInfo>()].clone_from_slice(fill.as_bytes());
         fill_off = usize_add(fill_off, size_of::<FillInfo>())?;
-        curr = usize_add(curr, header.total_sz)?;
+        curr = next_curr;
     }
     let total = write_offset;
 
     // Second pass. Writes fill chunks.
-    // Use all reamining buffer as fill buffer.
-    let (fill_infos, fill_buffer) = sparse_img.split_at_mut(fill_off);
+    // Reuse all remaining buffer space in `buf` as the fill scratch buffer.
+    let (fill_infos, fill_buffer) = buf.split_at_mut(fill_off);
     let mut fill_buffer = FillBuffer { curr_val: None, curr_size: 0, buffer: fill_buffer };
     let fill_infos = Ref::<_, [FillInfo]>::new_slice(fill_infos)
         .ok_or("Invalid sparse buffer alignment")?
@@ -229,7 +235,11 @@ struct FillBuffer<'a> {
 impl FillBuffer<'_> {
     /// Get a buffer up to `size` number of bytes filled with `val`.
     fn get(&mut self, val: u32, size: u64) -> Result<&mut [u8], Error> {
-        let aligned_len = self.buffer.len() - (self.buffer.len() % size_of::<u32>());
+        let max_len = min(self.buffer.len(), MAX_FILL_CHUNK_SIZE);
+        let aligned_len = max_len - (max_len % size_of::<u32>());
+        if aligned_len == 0 {
+            return Err(ERR_IMAGE_SIZE.into());
+        }
         let size: usize = to_usize(min(to_u64(aligned_len)?, size))?;
         if Some(val) != self.curr_val {
             self.curr_size = 0;
@@ -318,7 +328,7 @@ mod test {
         // Gives a larger output buffer.
         let mut out = vec![0u8; 2 * raw.len()];
         assert_eq!(
-            block_on(write_sparse_image(&mut sparse.to_vec()[..], &mut out)).unwrap(),
+            block_on(write_sparse_image(&mut sparse.to_vec()[..], sparse.len(), &mut out)).unwrap(),
             raw.len().try_into().unwrap()
         );
         assert_eq!(out[..raw.len()].to_vec(), raw);
@@ -331,7 +341,7 @@ mod test {
         // Gives a larger output buffer.
         let mut out = vec![0u8; 2 * raw.len()];
         assert_eq!(
-            block_on(write_sparse_image(&mut sparse.to_vec()[..], &mut out)).unwrap(),
+            block_on(write_sparse_image(&mut sparse.to_vec()[..], sparse.len(), &mut out)).unwrap(),
             raw.len().try_into().unwrap()
         );
         assert_eq!(out[..raw.len()].to_vec(), raw);
@@ -345,40 +355,124 @@ mod test {
     #[test]
     fn test_sparse_invalid_magic() {
         let mut sparse = include_bytes!("../../testdata/sparse_test.bin").to_vec();
+        let len = sparse.len();
         let mut sparse_header: SparseHeader = copy_from(&sparse[..]).unwrap();
         sparse_header.magic = 0;
         copy_to(&sparse_header, &mut sparse[..]);
         let mut out = vec![];
-        assert!(block_on(write_sparse_image(&mut sparse[..], &mut out)).is_err());
+        assert!(block_on(write_sparse_image(&mut sparse[..], len, &mut out)).is_err());
     }
 
     #[test]
     fn test_sparse_invalid_major_version() {
         let mut sparse = include_bytes!("../../testdata/sparse_test.bin").to_vec();
+        let len = sparse.len();
         let mut sparse_header: SparseHeader = copy_from(&sparse[..]).unwrap();
         sparse_header.major_version = SPARSE_HEADER_MAJOR_VER + 1;
         copy_to(&sparse_header, &mut sparse[..]);
         let mut out = vec![];
-        assert!(block_on(write_sparse_image(&mut sparse[..], &mut out)).is_err());
+        assert!(block_on(write_sparse_image(&mut sparse[..], len, &mut out)).is_err());
     }
 
     #[test]
     fn test_sparse_invalid_minor_version() {
         let mut sparse = include_bytes!("../../testdata/sparse_test.bin").to_vec();
+        let len = sparse.len();
         let mut sparse_header: SparseHeader = copy_from(&sparse[..]).unwrap();
         sparse_header.minor_version = SPARSE_HEADER_MINOR_VER + 1;
         copy_to(&sparse_header, &mut sparse[..]);
         let mut out = vec![];
-        assert!(block_on(write_sparse_image(&mut sparse[..], &mut out)).is_err());
+        assert!(block_on(write_sparse_image(&mut sparse[..], len, &mut out)).is_err());
     }
 
     #[test]
     fn test_sparse_chunks_exceed_total_blks() {
         let mut sparse = include_bytes!("../../testdata/sparse_test.bin").to_vec();
+        let len = sparse.len();
         let mut sparse_header: SparseHeader = copy_from(&sparse[..]).unwrap();
         sparse_header.total_blks = 1;
         copy_to(&sparse_header, &mut sparse[..]);
         let mut out = vec![0u8; 100 * 1024];
-        assert!(block_on(write_sparse_image(&mut sparse[..], &mut out)).is_err());
+        assert!(block_on(write_sparse_image(&mut sparse[..], len, &mut out)).is_err());
+    }
+
+    #[test]
+    fn test_sparse_compact_fill_reuses_full_scratch_buffer_and_bounds_parsing() {
+        struct CountingWriter {
+            out: Vec<u8>,
+            writes: usize,
+        }
+
+        impl SparseRawWriter for CountingWriter {
+            async fn write(&mut self, off: u64, data: &mut [u8]) -> Result<(), Error> {
+                self.writes += 1;
+                self.out[usize::try_from(off).unwrap()..][..data.len()].clone_from_slice(data);
+                Ok(())
+            }
+        }
+
+        const BLK_SZ: u32 = 4096;
+        const TOTAL_BLKS: u32 = 16; // 64 KiB expanded
+        const FILL_VAL: u32 = 0x1234_5678;
+        let hdr = SparseHeader {
+            magic: HEADER_MAGIC,
+            major_version: SPARSE_HEADER_MAJOR_VER,
+            minor_version: SPARSE_HEADER_MINOR_VER,
+            file_hdr_sz: u16::try_from(size_of::<SparseHeader>()).unwrap(),
+            chunk_hdr_sz: u16::try_from(size_of::<ChunkHeader>()).unwrap(),
+            blk_sz: BLK_SZ,
+            total_blks: TOTAL_BLKS,
+            total_chunks: 1,
+            image_checksum: 0,
+        };
+        let chunk = ChunkHeader {
+            chunk_type: CHUNK_TYPE_FILL,
+            reserved1: 0,
+            chunk_sz: TOTAL_BLKS,
+            total_sz: u32::try_from(size_of::<ChunkHeader>() + size_of::<u32>()).unwrap(),
+        };
+        let img_size = size_of::<SparseHeader>() + size_of::<ChunkHeader>() + size_of::<u32>();
+        assert_eq!(img_size, 44);
+
+        // Place the 44-byte image at the start of a 64 KiB buffer filled with trailing garbage.
+        let mut buf = vec![0xffu8; 64 * 1024];
+        buf[..size_of::<SparseHeader>()].clone_from_slice(hdr.as_bytes());
+        buf[size_of::<SparseHeader>()..][..size_of::<ChunkHeader>()]
+            .clone_from_slice(chunk.as_bytes());
+        buf[size_of::<SparseHeader>() + size_of::<ChunkHeader>()..img_size]
+            .clone_from_slice(&FILL_VAL.to_le_bytes());
+
+        let mut writer =
+            CountingWriter { out: vec![0u8; usize::try_from(hdr.data_size()).unwrap()], writes: 0 };
+        assert_eq!(
+            block_on(write_sparse_image(&mut buf, img_size, &mut writer)).unwrap(),
+            hdr.data_size()
+        );
+        // Full 64 KiB scratch buffer (minus 8-byte FillInfo = 65528 bytes) covers 64 KiB in 2
+        // writes instead of 65536 / 36 = 1821 tiny unaligned writes.
+        assert_eq!(writer.writes, 2);
+        assert_eq!(
+            writer.out,
+            FILL_VAL
+                .to_le_bytes()
+                .into_iter()
+                .cycle()
+                .take(usize::try_from(hdr.data_size()).unwrap())
+                .collect::<Vec<_>>()
+        );
+
+        // Declaring a second chunk beyond `img_size` must fail even though `buf` is 64 KiB.
+        let mut bad_buf = vec![0xffu8; 64 * 1024];
+        let bad_hdr = SparseHeader { total_chunks: 2, total_blks: TOTAL_BLKS * 2, ..hdr };
+        bad_buf[..size_of::<SparseHeader>()].clone_from_slice(bad_hdr.as_bytes());
+        bad_buf[size_of::<SparseHeader>()..][..size_of::<ChunkHeader>()]
+            .clone_from_slice(chunk.as_bytes());
+        bad_buf[size_of::<SparseHeader>() + size_of::<ChunkHeader>()..img_size]
+            .clone_from_slice(&FILL_VAL.to_le_bytes());
+        // Even if valid chunk bytes appear immediately after `img_size`, Pass 1 must not read them.
+        bad_buf[img_size..][..size_of::<ChunkHeader>()].clone_from_slice(chunk.as_bytes());
+        bad_buf[img_size + size_of::<ChunkHeader>()..][..size_of::<u32>()]
+            .clone_from_slice(&FILL_VAL.to_le_bytes());
+        assert!(block_on(write_sparse_image(&mut bad_buf, img_size, &mut writer.out)).is_err());
     }
 }
