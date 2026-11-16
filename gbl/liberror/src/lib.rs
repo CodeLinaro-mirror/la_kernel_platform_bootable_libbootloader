@@ -235,6 +235,10 @@ pub enum Error {
     OutOfRange,
     /// A resource has run out.
     OutOfResources,
+    /// The requested partition was not found.
+    PartitionNotFound,
+    /// The slotted partition exists for other slots but not for the contained slot suffix.
+    PartitionSlotMissing(char),
     /// A protocol error occurred during the network operation.
     ProtocolError,
     /// The function was not performed due to a security violation.
@@ -463,7 +467,7 @@ impl From<avb::IoError> for Error {
         match value {
             IoError::Oom => Self::OutOfResources,
             IoError::Io => Self::BlockIoError,
-            IoError::NoSuchPartition => Self::NotFound,
+            IoError::NoSuchPartition => Self::PartitionNotFound,
             IoError::RangeOutsidePartition => Self::OutOfRange,
             IoError::NoSuchValue => Self::InvalidInput,
             IoError::InvalidValueSize => Self::InvalidInput,

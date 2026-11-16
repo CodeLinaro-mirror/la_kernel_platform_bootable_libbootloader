@@ -61,7 +61,7 @@ pub fn write_bootloader_message<'a>(
 ///
 /// * `Ok(MiscVirtualAbMessage)` if a valid Virtual A/B message is present in `misc`.
 /// * `Err(Error::Unsupported)` if the target OS is Fuchsia.
-/// * `Err(Error::NotFound)` if the `misc` partition does not exist.
+/// * `Err(Error::PartitionNotFound)` if the `misc` partition does not exist.
 /// * `Err(Error::OutOfRange)` if the `misc` partition is too small to hold system space.
 /// * `Err(Error::InvalidInput)` if the Virtual A/B message header is uninitialized or invalid.
 pub async fn read_virtual_ab_message<'a>(
@@ -158,7 +158,10 @@ pub(crate) mod test {
         // Missing misc partition returns NotFound.
         let empty_storage = FakeGblOpsStorage::default();
         let mut empty_ops = FakeGblOps::new(&empty_storage);
-        assert_eq!(block_on(read_virtual_ab_message(&mut empty_ops)), Err(Error::NotFound));
+        assert_eq!(
+            block_on(read_virtual_ab_message(&mut empty_ops)),
+            Err(Error::PartitionNotFound)
+        );
 
         // Too-small misc partition returns OutOfRange.
         let mut small_storage = FakeGblOpsStorage::default();

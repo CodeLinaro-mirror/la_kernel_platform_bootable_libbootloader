@@ -220,7 +220,7 @@ pub trait GblOps<'a> {
     fn partition_size(&mut self, part: &str) -> Result<Option<u64>, Error> {
         match check_part_unique(self.disks(), part) {
             Ok((_, p)) => Ok(Some(p.size()?)),
-            Err(Error::NotFound) => Ok(None),
+            Err(Error::PartitionNotFound) => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -1429,6 +1429,10 @@ pub(crate) mod test {
         /// For return by `fastboot_get_partition_type`.
         pub partition_type: HashMap<String, FastbootPartitionType>,
 
+        /// Custom platform Fastboot variables `(args, value)` returned by `fastboot_variable` and
+        /// `fastboot_visit_all_variables`.
+        pub custom_fastboot_vars: Vec<(Vec<CString>, CString)>,
+
         /// For return by `get_fw_api_level`.
         pub fw_api_level: Option<Result<u64, Error>>,
 
@@ -1841,6 +1845,19 @@ pub(crate) mod test {
             mut args: impl Iterator<Item = &'arg CStr> + Clone,
             out: &mut [u8],
         ) -> Result<usize, Error> {
+            let mut query = vec![name.to_str()?];
+            for arg in args.clone() {
+                query.push(arg.to_str()?);
+            }
+            for (entry_args, val) in &self.custom_fastboot_vars {
+                let entry_strs: Vec<&str> = match entry_args.as_slice() {
+                    [single] => single.to_str()?.split(':').collect(),
+                    many => many.iter().map(|s| s.to_str()).collect::<Result<Vec<_>, _>>()?,
+                };
+                if entry_strs == query {
+                    return Ok(snprintf!(out, "{}", val.to_str()?).len());
+                }
+            }
             match name.to_str()? {
                 Self::GBL_TEST_VAR => {
                     Ok(snprintf!(out, "{}:{:?}", Self::GBL_TEST_VAR_VAL, args.next()).len())
@@ -1869,10 +1886,15 @@ pub(crate) mod test {
                 &CString::new(Self::GBL_TEST_VAR_UNSPLIT_VAL).unwrap(),
             );
 
-            for v in crate::fastboot::vars::GETVAR_ALL_FILTER {
-                cb(self, &[&CString::new(*v).unwrap()], c"dont-care");
+            for (entry_args, val) in self.custom_fastboot_vars.clone() {
+                let refs: Vec<&CStr> = entry_args.iter().map(|s| s.as_c_str()).collect();
+                cb(self, &refs, val.as_c_str());
             }
-            // Concatenated reserved variables should also be filtered.
+
+            // Reserved GBL variables (both standalone and ':'-concatenated) should be filtered.
+            cb(self, &[c"version-gbl"], c"dont-care");
+            cb(self, &[c"slot-count"], c"dont-care");
+            cb(self, &[c"snapshot-update-status"], c"dont-care");
             cb(self, &[c"block-device:1"], c"dont-care");
 
             Ok(())

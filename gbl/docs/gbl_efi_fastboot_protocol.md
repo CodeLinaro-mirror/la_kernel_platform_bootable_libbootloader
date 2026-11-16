@@ -148,6 +148,13 @@ of the given variable. Variables may have zero or more additional arguments.
 These arguments are parsed by the caller and passed to `GetVar()` as an array of
 NULL-terminated UTF-8 encoded string.
 
+In addition to purely vendor-defined variables, GBL queries `GetVar()` (and
+allows `GetVarAll()` entries) for `has-slot`, `partition-size`,
+`partition-type`, `partition-guid`, and `partition-start` when the target
+partition is a virtual partition not managed by GBL (i.e. not a GPT or raw block
+partition, and not a `super` dynamic partition for `has-slot`). `has-slot` is
+only queried when device slotting is supported.
+
 An example client interaction:
 
 ```bash
@@ -247,6 +254,9 @@ A null-terminated string representing the value.
 `GetVarAll()` iterates all combinations of arguments and values for all fastboot
 variables. For each combination, the function invokes the caller provided
 callback `GetVarAllCallback()` and passes the context, arguments and value.
+While inside `GetVarAllCallback()`, GBL may invoke other UEFI protocols (such as
+`GBL_EFI_BOOT_CONTROL_PROTOCOL`) to filter variables managed by GBL, so firmware
+implementations must allow those calls while `GetVarAll()` is active.
 
 ### Status Codes Returned
 

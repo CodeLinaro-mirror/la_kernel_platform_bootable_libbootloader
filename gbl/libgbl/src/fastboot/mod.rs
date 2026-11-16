@@ -167,6 +167,58 @@ impl<'a, 'b, B: BlockIo, P2: BufferPool, P: BufferPool> TaskWorkload<'a, 'b, B, 
     }
 }
 
+/// Resolves the 0-based index and metadata of the currently booted slot reported by
+/// `GblOps::get_current_slot` (`GBL_EFI_BOOT_CONTROL_PROTOCOL.GetCurrentSlot()`), or `Ok(None)` if
+/// slotting is unsupported or no current slot is reported.
+fn current_slot_with_index<'a>(gbl_ops: &mut impl GblOps<'a>) -> Result<Option<(u8, Slot)>, Error> {
+    let cur = match gbl_ops.get_current_slot() {
+        Ok(slot) => slot,
+        Err(Error::Unsupported | Error::NotFound) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let count = match gbl_ops.get_slot_count() {
+        Ok(count) => count,
+        Err(Error::Unsupported | Error::NotFound) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    for idx in 0..count {
+        if gbl_ops.get_slot_info(idx)?.suffix == cur.suffix {
+            return Ok(Some((idx, cur)));
+        }
+    }
+    Ok(None)
+}
+
+/// Strips the slot suffix from an exactly matched partition `name` if that suffix is a real device
+/// slot suffix, returning the base name; otherwise returns `name` unchanged.
+///
+/// This never fails: explicit slotted names must remain usable for recovery even when the boot
+/// control protocol is unavailable or broken.
+fn strip_device_slot_suffix<'a, 's>(gbl_ops: &mut impl GblOps<'a>, name: &'s str) -> &'s str {
+    // Only consult the device slots when the name has a candidate `_[a-z]` suffix.
+    let Some((lexical_base, _)) = split_partition_suffix(name) else {
+        return name;
+    };
+    match vars::SlotSuffixMask::new(gbl_ops) {
+        Ok(Some(mask)) => match mask.split(name) {
+            Some((base, _)) => base,
+            None => name,
+        },
+        // Without slotting `_[a-z]` is never a slot suffix.
+        Ok(None) => name,
+        // Fall back to the lexical split on a slot query error. `parse_and_get_partition_io`
+        // matches partition attributes against both the base name and the exact name, so neither
+        // form's attributes are bypassed.
+        Err(e) => {
+            gbl_println!(
+                gbl_ops,
+                "Warning: failed to query device slots ({e}); treating `{name}` as slotted"
+            );
+            lexical_base
+        }
+    }
+}
+
 /// Virtual A/B snapshot cancellation action required before executing a partition write task.
 enum SnapshotMergeCancel {
     /// No snapshot merge cancellation is required before scheduling the task.
@@ -341,33 +393,30 @@ pub(crate) enum ResolveMode {
     AllSlots,
 }
 
-/// `GblFastboot` implements fastboot commands in the GBL context.
+/// `GblFastbootState` holds the fastboot session state for [GblFastboot].
 ///
 /// # Lifetimes
 ///
 /// * `'a`: [GblOps] and disks lifetime.
 /// * `'b`: Lifetime for the buffer allocated by `P`.
 /// * `'c`: Lifetime of the pinned [Future]s in task container `task`.
-/// * `'d`: Lifetime of the `tasks` and `gbl_ops` objects borrowed.
+/// * `'d`: Lifetime of the borrowed `tasks` object.
 ///
 /// # Generics
 ///
-/// * `G`: Type of `Self::gbl_ops` which implements [GblOps].
 /// * `B`: Type that implements [BlockIo] in the [Disk] parameter of [GblDisk] for `Self::disks`.
-/// * `S`: Type of scratch buffer in the [Disk] parameter of [GblDisk] for `Self::disks`.
+/// * `P2`: Type of scratch buffer in the [Disk] parameter of [GblDisk] for `Self::disks`.
 /// * `T`: Type of gpt buffer in the [Gpt] parameter of [GblDisk] for `Self::disks`.
 /// * `P`: Type of `Self::buffer_pool` which implements [BufferPool].
 /// * `C`: Type of `Self::tasks` which implements [PinFutContainerTyped].
 /// * `F`: Type of [Future] stored by `Self::Tasks`.
-struct GblFastboot<'a, 'b, 'c, 'd, G, B, P2, T, P, C, F>
+struct GblFastbootState<'a, 'b, 'c, 'd, B, P2, T, P, C, F>
 where
-    G: GblOps<'a>,
     B: BlockIo,
     P2: BufferPool,
     T: DerefMut<Target = [u8]>,
     P: BufferPool,
 {
-    pub(crate) gbl_ops: &'d mut G,
     // We store the partition devices returned by `gbl_ops.disks()` directly instead of getting it
     // from `gbl_ops` later because we need to establish to the compiler that the hidden type of
     // [BlockIo] in `GblDisk<Disk<impl BlockIO...>...>` returned by `gbl_ops.disks()` will be the
@@ -396,8 +445,24 @@ where
     _tasks_context_lifetime: PhantomData<&'c P>,
 }
 
-// See definition of [GblFastboot] for docs on lifetimes and generics parameters.
-impl<'a: 'c, 'b: 'c, 'c, 'd, G, B, P2, T, P, C, F> GblFastboot<'a, 'b, 'c, 'd, G, B, P2, T, P, C, F>
+/// `GblFastboot` implements fastboot commands in the GBL context.
+///
+/// # Lifetimes
+///
+/// * `'d`: Lifetime of the borrowed `gbl_ops` object.
+///
+/// # Generics
+///
+/// * `G`: Type of `Self::gbl_ops` which implements [GblOps].
+/// * `S`: Type of `Self::state` ([GblFastbootState]).
+struct GblFastboot<'d, G, S> {
+    pub(crate) gbl_ops: &'d mut G,
+    state: S,
+}
+
+// See definition of [GblFastboot] and [GblFastbootState] for docs on lifetimes and generics.
+impl<'a: 'c, 'b: 'c, 'c, 'd, G, B, P2, T, P, C, F>
+    GblFastboot<'d, G, GblFastbootState<'a, 'b, 'c, 'd, B, P2, T, P, C, F>>
 where
     G: GblOps<'a>,
     B: BlockIo,
@@ -435,8 +500,7 @@ where
         buffer_pool: &'b Shared<P>,
         data: GblFbData<'b>,
     ) -> Self {
-        Self {
-            gbl_ops,
+        let state = GblFastbootState {
             disks,
             task_mapper,
             tasks,
@@ -453,7 +517,8 @@ where
             async_info_sent: false,
             pending_misc_task: false,
             _tasks_context_lifetime: PhantomData,
-        }
+        };
+        Self { gbl_ops, state }
     }
 
     /// Returns the shared task container.
@@ -462,7 +527,7 @@ where
     fn tasks(
         &self,
     ) -> &'d Shared<impl PinFutContainerTyped<'c, F> + use<'c, G, B, P2, T, P, C, F>> {
-        self.tasks
+        self.state.tasks
     }
 
     /// Listens on the given transports and TCP channels and runs fastboot.
@@ -536,7 +601,17 @@ where
 
         let _ = join_mut(cmd_loop_task, gbl_fb_tasks).await;
     }
+}
 
+impl<'a: 'c, 'b: 'c, 'c, 'd, B, P2, T, P, C, F> GblFastbootState<'a, 'b, 'c, 'd, B, P2, T, P, C, F>
+where
+    B: BlockIo,
+    P2: BufferPool,
+    T: DerefMut<Target = [u8]>,
+    P: BufferPool,
+    C: PinFutContainerTyped<'c, F>,
+    F: Future<Output = ()> + 'c,
+{
     /// Extracts the next argument and verifies that it is a valid block device ID if present.
     ///
     /// # Returns
@@ -588,6 +663,7 @@ where
     /// * Returns `Err()` otherwise.
     pub(crate) fn parse_flash_gpt_args(
         &mut self,
+        gbl_ops: &mut impl GblOps<'a>,
         part: &str,
     ) -> CommandResult<Option<(usize, bool)>> {
         // Syntax: flash gpt/<blk_idx>/"resize"
@@ -609,7 +685,7 @@ where
         };
         // Check the critical lock - GPT modification gives the ability to modify any other
         // partition, so we check for full-disk access.
-        self.check_full_disk_critical_unlocked()?;
+        self.check_full_disk_critical_unlocked(gbl_ops)?;
         Ok(Some((blk_id, resize)))
     }
 
@@ -634,6 +710,8 @@ where
 
     /// Helper for resolving the block device ID and partition info for given optional partition
     /// name and block device ID.
+    ///
+    /// Returns `Err(Error::PartitionNotFound)` if the partition does not exist on GBL's disks.
     fn find_partition<'s>(
         &self,
         part: Option<&'s str>,
@@ -657,7 +735,7 @@ where
             // If we run into more of such legacy aliases that we can't migrate, consider adding
             // interfaces in GblOps for this.
             #[cfg(feature = "fuchsia")]
-            Err(Error::NotFound) if part == Some("fvm") => find(Some("fuchsia-fvm"))?,
+            Err(Error::PartitionNotFound) if part == Some("fvm") => find(Some("fuchsia-fvm"))?,
             v => v?,
         })
     }
@@ -682,43 +760,85 @@ where
     ///
     /// A tuple containing:
     ///
-    /// * The base name of the resolved partition without any slot suffix, or `None` for raw disk.
+    /// * The base name of the resolved partition without its device slot suffix (if any), or
+    ///   `None` for raw disk.
     /// * The list of `(block device ID, Partition)` tuples corresponding to this partition.
+    ///
+    /// # Errors
+    ///
+    /// * `Error::PartitionNotFound` if neither `target` nor any `<base>_<slot>` variant exists.
+    /// * `Error::PartitionSlotMissing(slot)` if `<base>_<slot>` variants exist for some device
+    ///   slots but not for the one(s) required by `resolve_mode`.
     fn resolve_slotted_partitions<'s>(
-        &mut self,
+        &self,
+        gbl_ops: &mut impl GblOps<'a>,
         target: Option<&'s str>,
         blk_id: Option<usize>,
         resolve_mode: ResolveMode,
     ) -> Result<(Option<&'s str>, ArrayVec<(usize, Partition), MAX_IO_PARTS>), Error> {
         match self.find_partition(target, blk_id) {
             // If there is an exact match, use it.
-            Ok(block_id_and_part) => Ok((
-                target.map(|p| split_partition_suffix(p).map(|(base, _)| base).unwrap_or(p)),
-                [block_id_and_part].into_iter().collect(),
-            )),
+            Ok(block_id_and_part) => {
+                let basename = target.map(|name| strip_device_slot_suffix(gbl_ops, name));
+                Ok((basename, [block_id_and_part].into_iter().collect()))
+            }
             // If we didn't match but have a target name, check for slot suffixes.
-            Err(Error::NotFound) if target.is_some() => {
+            Err(Error::PartitionNotFound) if target.is_some() => {
                 let target = target.unwrap();
+
+                // Without slotting there are no slotted variants to resolve `target` to.
+                let Some(slot_count) = vars::slot_count_if_supported(gbl_ops)? else {
+                    return Err(Error::PartitionNotFound);
+                };
 
                 // `_ab` suffix is a way for users to force all-slots mode.
                 let (base, resolve_mode) = match target.strip_suffix("_ab") {
                     Some(base) => (base, ResolveMode::AllSlots),
                     None => (target, resolve_mode),
                 };
-
-                let slots: ArrayVec<Suffix, MAX_IO_PARTS> = match resolve_mode {
-                    ResolveMode::AllSlots => {
-                        [Suffix::from_char('a').unwrap(), Suffix::from_char('b').unwrap()].into()
-                    }
-                    ResolveMode::CurrentSlot => {
-                        [self.gbl_ops.get_current_slot()?.suffix].into_iter().collect()
-                    }
+                let find_slotted = |slot: Suffix| {
+                    self.find_partition(Some(slotted_part(base, Some(slot)).as_str()), blk_id)
                 };
 
                 let mut res = ArrayVec::new();
-                for slot in slots {
-                    let full = slotted_part(base, Some(slot));
-                    res.push(self.find_partition(Some(full.as_str()), blk_id)?);
+                match resolve_mode {
+                    ResolveMode::AllSlots => {
+                        // Every device slot must exist.
+                        let mut missing = None;
+                        for idx in 0..slot_count {
+                            let slot = gbl_ops.get_slot_info(idx)?.suffix;
+                            match find_slotted(slot) {
+                                Ok(v) => res
+                                    .try_push(v)
+                                    .map_err(|_| Error::TooManyPartitions(MAX_IO_PARTS))?,
+                                Err(Error::PartitionNotFound) => missing = missing.or(Some(slot)),
+                                Err(e) => return Err(e),
+                            }
+                        }
+                        match missing {
+                            _ if res.is_empty() => return Err(Error::PartitionNotFound),
+                            Some(slot) => return Err(Error::PartitionSlotMissing(slot.as_char())),
+                            None => {}
+                        }
+                    }
+                    ResolveMode::CurrentSlot => {
+                        let current = gbl_ops.get_current_slot()?.suffix;
+                        match find_slotted(current) {
+                            Ok(v) => res.push(v),
+                            // Only probe the other slots when the current one is missing, to
+                            // tell "missing for this slot" apart from "does not exist at all".
+                            Err(Error::PartitionNotFound) => {
+                                for idx in 0..slot_count {
+                                    let slot = gbl_ops.get_slot_info(idx)?.suffix;
+                                    if slot != current && find_slotted(slot).is_ok() {
+                                        return Err(Error::PartitionSlotMissing(current.as_char()));
+                                    }
+                                }
+                                return Err(Error::PartitionNotFound);
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
                 }
                 Ok((Some(base), res))
             }
@@ -755,6 +875,7 @@ where
     /// task to ensure proper sequencing and disk consistency.
     async fn parse_and_get_partition_io<'s, A: AccessMode>(
         &mut self,
+        gbl_ops: &mut impl GblOps<'a>,
         target: &'s str,
     ) -> CommandResult<(MultiPartitionIo<'a, B, P2, MAX_IO_PARTS, A>, Fdr, SnapshotMergeCancel)>
     {
@@ -768,7 +889,7 @@ where
         }
 
         let (basename, block_ids_and_parts) =
-            self.resolve_slotted_partitions(part, blk_id, ResolveMode::CurrentSlot)?;
+            self.resolve_slotted_partitions(gbl_ops, part, blk_id, ResolveMode::CurrentSlot)?;
 
         // Determine if we need to FDR, check critical lock protection, and enforce Virtual A/B
         // write guards.
@@ -779,15 +900,23 @@ where
             match basename {
                 // Named partition access.
                 Some(basename) => {
-                    // Check partition attributes for FDR or critical.
-                    let (fdr, critical) = self
-                        .gbl_ops
-                        .avb_read_partition_attributes()?
-                        .find(|p| p.name.as_str() == basename)
-                        .map(|p| (p.fdr, p.critical))
-                        .unwrap_or((Fdr::No, Critical::No));
+                    // Check partition attributes for FDR or critical. An attribute declared for
+                    // either the resolved base name or the exact requested name is honored.
+                    let (mut fdr, mut critical) = (Fdr::No, Critical::No);
+                    for attr in gbl_ops.avb_read_partition_attributes()? {
+                        let name = attr.name.as_str();
+                        if name != basename && Some(name) != part {
+                            continue;
+                        }
+                        if attr.fdr == Fdr::Yes {
+                            fdr = Fdr::Yes;
+                        }
+                        if attr.critical == Critical::Yes {
+                            critical = Critical::Yes;
+                        }
+                    }
                     if critical == Critical::Yes {
-                        self.check_critical_unlocked()?
+                        self.check_critical_unlocked(gbl_ops)?
                     }
                     // During an unmerged Virtual A/B OTA, `userdata` holds the COW snapshot files,
                     // `metadata` holds `libsnapshot` state and COW block mappings, and `misc` holds
@@ -808,10 +937,10 @@ where
                     } else if matches!(basename, "userdata" | "misc" | "metadata")
                         || fdr == Fdr::Yes
                     {
-                        match self.read_virtual_ab_msg_if_present().await? {
+                        match self.read_virtual_ab_msg_if_present(gbl_ops).await? {
                             Some(msg)
                                 if matches!(
-                                    self.effective_merge_status(&msg)?,
+                                    self.effective_merge_status(gbl_ops, &msg)?,
                                     MergeStatus::Snapshotted | MergeStatus::Merging
                                 ) =>
                             {
@@ -851,7 +980,7 @@ where
                     // get around the critical lock. We could try to lookup which partition(s) this
                     // raw access hits and be more precise with the lock, but we should wait until
                     // we have a use case before adding that complexity.
-                    self.check_full_disk_critical_unlocked()?;
+                    self.check_full_disk_critical_unlocked(gbl_ops)?;
                     self.pending_misc_task = true;
 
                     // No FDR.
@@ -936,6 +1065,7 @@ where
     /// * `responder`: an object to send `INFO` messages back to the host with
     async fn schedule_task(
         &mut self,
+        gbl_ops: &mut impl GblOps<'a>,
         task: &mut Task<'a, 'b, B, P2, P>,
         snapshot_cancel: SnapshotMergeCancel,
         responder: &mut impl InfoSender,
@@ -943,10 +1073,10 @@ where
         match snapshot_cancel {
             SnapshotMergeCancel::None => {}
             SnapshotMergeCancel::IfPresent => {
-                self.cancel_active_snapshot_merge_if_present().await?;
+                self.cancel_active_snapshot_merge_if_present(gbl_ops).await?;
             }
             SnapshotMergeCancel::Message(msg) => {
-                self.write_cancelled_virtual_ab_msg(msg).await?;
+                self.write_cancelled_virtual_ab_msg(gbl_ops, msg).await?;
             }
         }
         match self.enable_async_task {
@@ -984,7 +1114,12 @@ where
     ///
     /// * `responder`: an object to send `INFO` messages back to the host with
     /// * `tag`: a string to tag the `INFO` message with
-    async fn sync_tasks(&mut self, responder: &mut impl InfoSender, tag: &str) {
+    async fn sync_tasks(
+        &mut self,
+        gbl_ops: &mut impl GblOps<'a>,
+        responder: &mut impl InfoSender,
+        tag: &str,
+    ) {
         let mut num_tasks = 0;
         loop {
             let new_num_tasks = self.tasks.borrow_mut().poll_all();
@@ -1001,7 +1136,7 @@ where
                 {
                     // We're probably broken if we can't transmit an INFO message, but just log
                     // the error and hope we can recover when we get back to the main loop.
-                    gbl_println!(self.gbl_ops, "sync_tasks() failed to send INFO message: {}", e);
+                    gbl_println!(gbl_ops, "sync_tasks() failed to send INFO message: {}", e);
                 }
                 num_tasks = new_num_tasks;
             }
@@ -1010,42 +1145,49 @@ where
     }
 
     /// Implementation for "fastboot oem gbl-sync-tasks".
-    async fn oem_sync_tasks(&mut self, responder: &mut impl InfoSender) -> CommandResult<()> {
-        self.sync_tasks(responder, "Sync").await;
+    async fn oem_sync_tasks(
+        &mut self,
+        gbl_ops: &mut impl GblOps<'a>,
+        responder: &mut impl InfoSender,
+    ) -> CommandResult<()> {
+        self.sync_tasks(gbl_ops, responder, "Sync").await;
         Ok(())
     }
 
     /// Re-reads GPT partition tables across all GPT block devices.
-    async fn sync_gpts(&mut self) {
+    async fn sync_gpts(&mut self, gbl_ops: &mut impl GblOps<'a>) {
         for (idx, disk) in self.disks.iter().enumerate().filter(|(_, d)| d.is_gpt()) {
             // GPT operations are not scheduled as background tasks. No need to wait.
             let had_valid_gpt = disk.has_valid_gpt();
             match disk.sync_gpt().await {
                 Ok(Some(GptSyncResult::BothValid)) | Ok(None) => {}
                 Ok(Some(GptSyncResult::NoValidGpt { .. })) if !had_valid_gpt => {}
-                Ok(Some(res)) => gbl_println!(self.gbl_ops, "Block #{idx} GPT sync result: {res}"),
-                Err(e) => gbl_println!(self.gbl_ops, "Block #{idx} error while syncing GPT: {e}"),
+                Ok(Some(res)) => gbl_println!(gbl_ops, "Block #{idx} GPT sync result: {res}"),
+                Err(e) => gbl_println!(gbl_ops, "Block #{idx} error while syncing GPT: {e}"),
             }
         }
     }
 
     /// Sets the boot mode for the next reboot.
-    fn set_boot_mode(&mut self, mode: AndroidBootMode) -> CommandResult<()> {
+    fn set_boot_mode(
+        &mut self,
+        gbl_ops: &mut impl GblOps<'a>,
+        mode: AndroidBootMode,
+    ) -> CommandResult<()> {
         match mode {
             #[cfg(feature = "fuchsia")]
-            AndroidBootMode::BootloaderBootOnce if self.gbl_ops.expected_os_is_fuchsia()? => {
-                set_one_shot_bootloader(&mut GblAbrOps(self.gbl_ops), true)?;
+            AndroidBootMode::BootloaderBootOnce if gbl_ops.expected_os_is_fuchsia()? => {
+                set_one_shot_bootloader(&mut GblAbrOps(gbl_ops), true)?;
             }
             #[cfg(feature = "fuchsia")]
-            AndroidBootMode::Recovery if self.gbl_ops.expected_os_is_fuchsia()? => {
-                set_one_shot_recovery(&mut GblAbrOps(self.gbl_ops), true)?;
+            AndroidBootMode::Recovery if gbl_ops.expected_os_is_fuchsia()? => {
+                set_one_shot_recovery(&mut GblAbrOps(gbl_ops), true)?;
             }
             _ => {
                 // Update the bootloader message (BCB) in the `misc` partition.
-                let bcb =
-                    read_bootloader_message_to(self.gbl_ops, self.data.boot_buffer.scratch())?;
+                let bcb = read_bootloader_message_to(gbl_ops, self.data.boot_buffer.scratch())?;
                 bcb.update_boot_command(mode);
-                write_bootloader_message(self.gbl_ops, bcb)?;
+                write_bootloader_message(gbl_ops, bcb)?;
             }
         }
         Ok(())
@@ -1063,10 +1205,13 @@ where
 
     /// Reads the `MiscVirtualAbMessage` from `misc`, draining any pending `misc` write task and
     /// polling background fastboot tasks while awaiting disk I/O.
-    async fn read_virtual_ab_msg(&mut self) -> Result<MiscVirtualAbMessage, Error> {
+    async fn read_virtual_ab_msg(
+        &mut self,
+        gbl_ops: &mut impl GblOps<'a>,
+    ) -> Result<MiscVirtualAbMessage, Error> {
         self.wait_pending_misc_task().await;
         let tasks = self.tasks;
-        select(read_virtual_ab_message(self.gbl_ops), async {
+        select(read_virtual_ab_message(gbl_ops), async {
             loop {
                 yield_now().await;
                 tasks.borrow_mut().poll_all();
@@ -1081,19 +1226,21 @@ where
     /// initialized.
     ///
     /// Returns `Ok(None)` silently when the target OS does not use Android `misc`
-    /// (`Error::Unsupported`). When `misc` is absent (`Error::NotFound`), smaller than system space
+    /// (`Error::Unsupported`). When `misc` is absent (`Error::PartitionNotFound`), smaller than
+    /// system space
     /// (`Error::OutOfRange`), or lacks a valid `MiscVirtualAbMessage` header at `misc` + 32 KiB
     /// (`Error::InvalidInput`), logs a console warning (so non-standard Boot Control HALs surface
     /// during bring-up) and returns `Ok(None)`. Propagates genuine storage/device I/O errors.
     async fn read_virtual_ab_msg_if_present(
         &mut self,
+        gbl_ops: &mut impl GblOps<'a>,
     ) -> CommandResult<Option<MiscVirtualAbMessage>> {
-        match self.read_virtual_ab_msg().await {
+        match self.read_virtual_ab_msg(gbl_ops).await {
             Ok(msg) => Ok(Some(msg)),
             Err(Error::Unsupported) => Ok(None),
-            Err(e @ (Error::NotFound | Error::OutOfRange | Error::InvalidInput)) => {
+            Err(e @ (Error::PartitionNotFound | Error::OutOfRange | Error::InvalidInput)) => {
                 gbl_println!(
-                    self.gbl_ops,
+                    gbl_ops,
                     "Warning: unusable Virtual A/B metadata in misc ({e}); skipping Virtual A/B \
                     guards"
                 );
@@ -1103,38 +1250,20 @@ where
         }
     }
 
-    /// Resolves the 0-based index and metadata of the currently booted slot reported by
-    /// `GblOps::get_current_slot` (`GBL_EFI_BOOT_CONTROL_PROTOCOL.GetCurrentSlot()`), or
-    /// `Ok(None)` if slotting is unsupported or no current slot is reported.
-    fn current_slot_with_index(&mut self) -> Result<Option<(u8, Slot)>, Error> {
-        let cur = match self.gbl_ops.get_current_slot() {
-            Ok(slot) => slot,
-            Err(Error::Unsupported | Error::NotFound) => return Ok(None),
-            Err(e) => return Err(e),
-        };
-        let count = match self.gbl_ops.get_slot_count() {
-            Ok(count) => count,
-            Err(Error::Unsupported | Error::NotFound) => return Ok(None),
-            Err(e) => return Err(e),
-        };
-        for idx in 0..count {
-            if self.gbl_ops.get_slot_info(idx)?.suffix == cur.suffix {
-                return Ok(Some((idx, cur)));
-            }
-        }
-        Ok(None)
-    }
-
     /// Computes the effective Virtual A/B snapshot merge status from `msg`.
     ///
     /// Matches AOSP `libboot_control` (`GetMiscVirtualAbMergeStatus`): if `msg` records
     /// `MergeStatus::Snapshotted` and the currently booted slot (`GetCurrentSlot()`) matches
     /// `msg.source_slot()` (e.g. after rolling back and rebooting into the pre-OTA slot),
     /// `first_stage_init` will discard the snapshot on boot, so report `MergeStatus::None`.
-    fn effective_merge_status(&mut self, msg: &MiscVirtualAbMessage) -> Result<MergeStatus, Error> {
+    fn effective_merge_status(
+        &mut self,
+        gbl_ops: &mut impl GblOps<'a>,
+        msg: &MiscVirtualAbMessage,
+    ) -> Result<MergeStatus, Error> {
         let status = msg.merge_status();
         if status == MergeStatus::Snapshotted
-            && self.current_slot_with_index()?.map(|(idx, _)| idx) == Some(msg.source_slot())
+            && current_slot_with_index(gbl_ops)?.map(|(idx, _)| idx) == Some(msg.source_slot())
         {
             return Ok(MergeStatus::None);
         }
@@ -1143,22 +1272,26 @@ where
 
     /// Returns the current Virtual A/B snapshot merge status from `misc`, draining any pending
     /// `misc` write task and polling background fastboot tasks while awaiting disk I/O.
-    pub(crate) async fn snapshot_merge_status(&mut self) -> CommandResult<MergeStatus> {
-        let msg = self.read_virtual_ab_msg().await?;
-        Ok(self.effective_merge_status(&msg)?)
+    pub(crate) async fn snapshot_merge_status(
+        &mut self,
+        gbl_ops: &mut impl GblOps<'a>,
+    ) -> CommandResult<MergeStatus> {
+        let msg = self.read_virtual_ab_msg(gbl_ops).await?;
+        Ok(self.effective_merge_status(gbl_ops, &msg)?)
     }
 
     /// Transitions `msg` in `misc` to `MergeStatus::Cancelled` if it represents an in-progress
     /// snapshot merge (`Snapshotted` or `Merging`).
     async fn write_cancelled_virtual_ab_msg(
         &mut self,
+        gbl_ops: &mut impl GblOps<'a>,
         mut msg: MiscVirtualAbMessage,
     ) -> CommandResult<()> {
         if matches!(msg.merge_status(), MergeStatus::Snapshotted | MergeStatus::Merging) {
             msg.set_merge_status(MergeStatus::Cancelled);
             self.wait_pending_misc_task().await;
             let tasks = self.tasks;
-            select(write_virtual_ab_message(self.gbl_ops, msg), async {
+            select(write_virtual_ab_message(gbl_ops, msg), async {
                 loop {
                     yield_now().await;
                     tasks.borrow_mut().poll_all();
@@ -1176,17 +1309,20 @@ where
     ///
     /// If no snapshot merge is in progress, this is a no-op. Fails if `misc` is unavailable or
     /// uninitialized.
-    async fn cancel_snapshot_merge(&mut self) -> CommandResult<()> {
-        let msg = self.read_virtual_ab_msg().await?;
-        self.write_cancelled_virtual_ab_msg(msg).await
+    async fn cancel_snapshot_merge(&mut self, gbl_ops: &mut impl GblOps<'a>) -> CommandResult<()> {
+        let msg = self.read_virtual_ab_msg(gbl_ops).await?;
+        self.write_cancelled_virtual_ab_msg(gbl_ops, msg).await
     }
 
     /// Cancels an in-progress Virtual A/B snapshot merge if Virtual A/B metadata is present and
     /// active in `misc`, no-oping when `misc` is missing, undersized, uninitialized, or
     /// non-Android.
-    async fn cancel_active_snapshot_merge_if_present(&mut self) -> CommandResult<()> {
-        if let Some(msg) = self.read_virtual_ab_msg_if_present().await? {
-            self.write_cancelled_virtual_ab_msg(msg).await?;
+    async fn cancel_active_snapshot_merge_if_present(
+        &mut self,
+        gbl_ops: &mut impl GblOps<'a>,
+    ) -> CommandResult<()> {
+        if let Some(msg) = self.read_virtual_ab_msg_if_present(gbl_ops).await? {
+            self.write_cancelled_virtual_ab_msg(gbl_ops, msg).await?;
         }
         Ok(())
     }
@@ -1194,28 +1330,29 @@ where
     /// Syncs all tasks and reboots.
     async fn sync_tasks_and_reboot(
         &mut self,
+        gbl_ops: &mut impl GblOps<'a>,
         mode: RebootMode,
         mut resp: impl InfoSender + OkaySender,
     ) -> CommandResult<Infallible> {
-        self.sync_tasks(&mut resp, "Reboot").await;
+        self.sync_tasks(gbl_ops, &mut resp, "Reboot").await;
         let msg = match mode {
             RebootMode::Normal => "Rebooting...",
             RebootMode::Bootloader => {
-                self.set_boot_mode(AndroidBootMode::BootloaderBootOnce)?;
+                self.set_boot_mode(gbl_ops, AndroidBootMode::BootloaderBootOnce)?;
                 "Rebooting to bootloader..."
             }
             RebootMode::Fastboot => {
-                self.set_boot_mode(AndroidBootMode::Fastboot)?;
+                self.set_boot_mode(gbl_ops, AndroidBootMode::Fastboot)?;
                 "Rebooting to userspace fastboot..."
             }
             RebootMode::Recovery => {
-                self.set_boot_mode(AndroidBootMode::Recovery)?;
+                self.set_boot_mode(gbl_ops, AndroidBootMode::Recovery)?;
                 "Rebooting to recovery..."
             }
         };
         resp.send_info(msg).await?;
         resp.send_okay("").await?;
-        Ok(self.gbl_ops.reboot()?)
+        Ok(gbl_ops.reboot()?)
     }
 
     /// Syncs all tasks and performs factory data reset.
@@ -1225,17 +1362,24 @@ where
     /// re-initialize user data partitions to a default state using the newly-rotated keys. We don't
     /// want to be modying the disk ourselves concurrently or we might end up in an inconsistent
     /// state.
-    async fn sync_tasks_and_fdr(&mut self, responder: &mut impl InfoSender) -> CommandResult<()> {
-        gbl_println!(self.gbl_ops, "Performing FDR");
-        self.sync_tasks(responder, "FDR").await;
-        Ok(self.gbl_ops.factory_data_reset()?)
+    async fn sync_tasks_and_fdr(
+        &mut self,
+        gbl_ops: &mut impl GblOps<'a>,
+        responder: &mut impl InfoSender,
+    ) -> CommandResult<()> {
+        gbl_println!(gbl_ops, "Performing FDR");
+        self.sync_tasks(gbl_ops, responder, "FDR").await;
+        Ok(gbl_ops.factory_data_reset()?)
     }
 
     /// Appends a staged payload as bootloader file.
     #[cfg(feature = "fuchsia")]
-    async fn add_staged_bootloader_file(&mut self, file_name: &str) -> CommandResult<()> {
-        let buffer = self
-            .gbl_ops
+    async fn add_staged_bootloader_file(
+        &mut self,
+        gbl_ops: &mut impl GblOps<'a>,
+        file_name: &str,
+    ) -> CommandResult<()> {
+        let buffer = gbl_ops
             .get_zbi_bootloader_files_buffer_aligned()
             .ok_or("No ZBI bootloader file buffer is provided")?;
         let data = self.current_download_buffer.as_mut().ok_or("No file staged")?;
@@ -1262,24 +1406,20 @@ where
         Ok(())
     }
 
-    /// Iterates all slots in the order of slot index.
-    fn slots_iter(&mut self) -> Result<impl Iterator<Item = Result<Slot, Error>> + '_, Error> {
-        Ok((0..self.gbl_ops.get_slot_count()?).map(|idx| self.gbl_ops.get_slot_info(idx)))
-    }
-
     /// Sets active slot.
     async fn set_active_slot(
         &mut self,
+        gbl_ops: &mut impl GblOps<'a>,
         suffix: char,
         responder: &mut impl InfoSender,
     ) -> CommandResult<()> {
-        self.sync_tasks(responder, "set_active").await;
+        self.sync_tasks(gbl_ops, responder, "set_active").await;
 
         #[cfg(feature = "fuchsia")]
-        if self.gbl_ops.expected_os_is_fuchsia()? {
+        if gbl_ops.expected_os_is_fuchsia()? {
             // TODO(b/578053863): Prioritizes platform specific `set_active_slot`  if available.
             return Ok(mark_slot_active(
-                &mut GblAbrOps(self.gbl_ops),
+                &mut GblAbrOps(gbl_ops),
                 match suffix {
                     'a' => SlotIndex::A,
                     'b' => SlotIndex::B,
@@ -1289,7 +1429,7 @@ where
         }
 
         let mut target_slot = None;
-        for (idx, slot) in self.slots_iter()?.enumerate() {
+        for (idx, slot) in vars::slots_iter(gbl_ops)?.enumerate() {
             if let Ok(slot) = slot
                 && slot.suffix.as_char() == suffix
             {
@@ -1314,18 +1454,18 @@ where
         // - Skip `GblOps::set_active_slot` (which clears `Successful` with no protocol method to
         //   re-mark it) only when the merging slot is already the currently booted slot, is
         //   `Successful`, and all other bootable slots have lower priority.
-        if let Some(msg) = self.read_virtual_ab_msg_if_present().await?
+        if let Some(msg) = self.read_virtual_ab_msg_if_present(gbl_ops).await?
             && msg.merge_status() == MergeStatus::Merging
         {
-            let current_slot = self.current_slot_with_index()?;
-            let slot_count = self.gbl_ops.get_slot_count()?;
+            let current_slot = current_slot_with_index(gbl_ops)?;
+            let slot_count = gbl_ops.get_slot_count()?;
             let merging_slot_idx = if msg.source_slot() < slot_count {
                 if let Some((cur_idx, cur)) = current_slot
                     && cur_idx != msg.source_slot()
                     && !matches!(cur.bootability, Bootability::Unbootable(_))
                 {
                     gbl_println!(
-                        self.gbl_ops,
+                        gbl_ops,
                         "Warning: Virtual A/B source_slot ({}) differs from bootable current \
                         slot '{}' (index {}) during Merging",
                         msg.source_slot(),
@@ -1336,7 +1476,7 @@ where
                 Some(msg.source_slot())
             } else {
                 gbl_println!(
-                    self.gbl_ops,
+                    gbl_ops,
                     "Warning: Virtual A/B source_slot ({}) out of range (slot_count={}) during \
                     Merging; falling back to current slot",
                     msg.source_slot(),
@@ -1353,7 +1493,7 @@ where
                 let mut highest_priority = true;
                 for other_idx in 0..slot_count {
                     if other_idx != idx {
-                        let other = self.gbl_ops.get_slot_info(other_idx)?;
+                        let other = gbl_ops.get_slot_info(other_idx)?;
                         if !matches!(other.bootability, Bootability::Unbootable(_))
                             && other.priority >= target_slot.priority
                         {
@@ -1364,22 +1504,27 @@ where
                 }
                 if highest_priority {
                     let info = "Skipping set_active reset of current slot during snapshot merge";
-                    gbl_println!(self.gbl_ops, "{info}");
+                    gbl_println!(gbl_ops, "{info}");
                     responder.send_info(info).await?;
                     return Ok(());
                 }
             }
         }
 
-        Ok(self.gbl_ops.set_active_slot(idx)?)
+        Ok(gbl_ops.set_active_slot(idx)?)
     }
 
     /// Helper for "fastboot boot" in Android image.
-    async fn boot_android(&mut self, img: &[u8], mut resp: impl InfoSender) -> CommandResult<()> {
-        let slot = get_boot_slot(self.gbl_ops)?;
+    async fn boot_android(
+        &mut self,
+        gbl_ops: &mut impl GblOps<'a>,
+        img: &[u8],
+        mut resp: impl InfoSender,
+    ) -> CommandResult<()> {
+        let slot = get_boot_slot(gbl_ops)?;
         let boot_part = slotted_part("boot", slot.map(|s| s.suffix));
         let mut ramboot_ops =
-            RambootOps { ops: self.gbl_ops, ram_partitions: &[(boot_part.as_str(), img)] };
+            RambootOps { ops: gbl_ops, ram_partitions: &[(boot_part.as_str(), img)] };
         let boot_buffer = self.data.boot_buffer.as_borrowed();
         let (ramdisk, fdt, kernel) =
             android_load_verify_fixup(&mut ramboot_ops, slot, false, boot_buffer)?;
@@ -1398,12 +1543,17 @@ where
 
     /// Helper for "fastboot boot" Fuchsia image.
     #[cfg(feature = "fuchsia")]
-    async fn boot_fuchsia(&mut self, img: &[u8], mut resp: impl InfoSender) -> CommandResult<()> {
+    async fn boot_fuchsia(
+        &mut self,
+        gbl_ops: &mut impl GblOps<'a>,
+        img: &[u8],
+        mut resp: impl InfoSender,
+    ) -> CommandResult<()> {
         let load_buffer = self.data.boot_buffer.scratch();
         // Format is ZBI + Vbmeta.
         let (zbi, vbmeta) = zbi_split_unused_buffer_ref(get_kernel(img)?)?;
         let mut ramboot_ops = RambootOps {
-            ops: self.gbl_ops,
+            ops: gbl_ops,
             ram_partitions: &[
                 ("zircon_a", zbi),
                 ("vbmeta_a", vbmeta),
@@ -1460,8 +1610,8 @@ where
     }
 
     /// Returns `Ok` if the device lock is unlocked.
-    fn check_unlocked(&mut self) -> CommandResult<()> {
-        match GblAvbOps::new(self.gbl_ops, None, &mut [], false).avb_read_device_status() {
+    fn check_unlocked(&self, gbl_ops: &mut impl GblOps<'a>) -> CommandResult<()> {
+        match GblAvbOps::new(gbl_ops, None, &mut [], false).avb_read_device_status() {
             Err(e) => Err(GblFastbootError::LockState(e)),
             Ok(status) if status.is_unlocked => Ok(()),
             _ => Err(ERR_DEVICE_LOCKED.into()),
@@ -1469,8 +1619,8 @@ where
     }
 
     /// Returns `Ok` if the critical lock is unlocked.
-    fn check_critical_unlocked(&mut self) -> CommandResult<()> {
-        match GblAvbOps::new(self.gbl_ops, None, &mut [], false).avb_read_device_status() {
+    fn check_critical_unlocked(&self, gbl_ops: &mut impl GblOps<'a>) -> CommandResult<()> {
+        match GblAvbOps::new(gbl_ops, None, &mut [], false).avb_read_device_status() {
             Err(e) => Err(GblFastbootError::LockState(e)),
             Ok(status) if status.is_unlocked_critical => Ok(()),
             _ => Err(ERR_CRITICAL_LOCKED.into()),
@@ -1482,12 +1632,15 @@ where
     /// This is useful for checking full-disk access e.g. GPT or raw disk. In this case, write
     /// access also provides the ability to modify any other partition on disk, so we require the
     /// critical lock if any partitions require it.
-    fn check_full_disk_critical_unlocked(&mut self) -> CommandResult<()> {
+    fn check_full_disk_critical_unlocked(
+        &self,
+        gbl_ops: &mut impl GblOps<'a>,
+    ) -> CommandResult<()> {
         // Check partition attributes first, it's probably cheaper. Even though it may involve
         // copying some partition name buffers around and looping on them, it will likely be done
         // entirely in UEFI whereas checking lock state requires a secure-world context switch.
-        match self.gbl_ops.avb_read_partition_attributes()?.any(|p| p.critical == Critical::Yes) {
-            true => self.check_critical_unlocked(),
+        match gbl_ops.avb_read_partition_attributes()?.any(|p| p.critical == Critical::Yes) {
+            true => self.check_critical_unlocked(gbl_ops),
             false => Ok(()),
         }
     }
@@ -1528,6 +1681,7 @@ where
     /// Upload OEM specific data.
     async fn upload_oem_data(
         &mut self,
+        gbl_ops: &mut impl GblOps<'a>,
         mut responder: impl UploadBuilder + InfoSender,
     ) -> CommandResult<()> {
         // Makes sure a download buffer can be allocated.
@@ -1535,7 +1689,7 @@ where
             responder.send_info("A previous download is discarded.").await?;
         }
         let mut buffer = self.take_or_allocate_download_buffer().await;
-        let (_, total) = self.gbl_ops.fastboot_get_staged(&mut [][..])?;
+        let (_, total) = gbl_ops.fastboot_get_staged(&mut [][..])?;
         if total == 0 {
             return Err("No data staged.".into());
         } else if total >= 0x7fffffff {
@@ -1551,7 +1705,7 @@ where
         let mut read_len: CommandResult<usize> = Ok(0);
         while left > 0 {
             read_len = read_len
-                .and_then(|_| Ok(self.gbl_ops.fastboot_get_staged(&mut buffer)?))
+                .and_then(|_| Ok(gbl_ops.fastboot_get_staged(&mut buffer)?))
                 .and_then(|(read, remains)| match left >= remains && left - remains == read {
                     true => Ok(read),
                     _ => Err("Staged data size changed when uploading".into()),
@@ -1590,28 +1744,28 @@ where
     /// preventing unlock and therefore preventing re-flashing.
     ///
     /// Callers are expected to always FDR following this.
-    async fn wipe_fdr_partitions(&mut self, responder: &mut impl InfoSender) {
+    async fn wipe_fdr_partitions(
+        &mut self,
+        gbl_ops: &mut impl GblOps<'a>,
+        responder: &mut impl InfoSender,
+    ) {
         // Wait for any async disk I/O to complete.
-        self.sync_tasks(responder, "Userdata wipe").await;
+        self.sync_tasks(gbl_ops, responder, "Userdata wipe").await;
 
         // Pre-FDR wipe and the subsequent FDR destroy `userdata` and `metadata` (where Virtual A/B
         // COW snapshot files and `libsnapshot` state live) without going through
         // `parse_and_get_partition_io`. Best-effort cancel any active snapshot merge in `misc` so
         // subsequent fastboot commands and `IBootControl` clients do not observe a stale
         // `Snapshotted` or `Merging` status after lock or unlock.
-        if let Err(e) = self.cancel_active_snapshot_merge_if_present().await {
-            gbl_println!(
-                self.gbl_ops,
-                "Failed to cancel snapshot merge during pre-FDR wipe ({:?})",
-                e
-            );
+        if let Err(e) = self.cancel_active_snapshot_merge_if_present(gbl_ops).await {
+            gbl_println!(gbl_ops, "Failed to cancel snapshot merge during pre-FDR wipe ({:?})", e);
         }
 
-        let attributes = match self.gbl_ops.avb_read_partition_attributes() {
+        let attributes = match gbl_ops.avb_read_partition_attributes() {
             Ok(attributes) => attributes,
             Err(e) => {
                 gbl_println!(
-                    self.gbl_ops,
+                    gbl_ops,
                     "Failed to determine FDR partitions, skipping pre-FDR wipe ({:?})",
                     e
                 );
@@ -1622,16 +1776,17 @@ where
         for attribute in attributes.filter(|p| p.fdr == Fdr::Yes) {
             let basename = attribute.name.as_str();
             let block_ids_and_parts = match self.resolve_slotted_partitions(
+                gbl_ops,
                 Some(basename),
                 None,
                 ResolveMode::AllSlots,
             ) {
                 // Missing partition may be pretty standard since we inject some defaults,
                 // just no-op this case.
-                Err(Error::NotFound) => continue,
+                Err(Error::PartitionNotFound) => continue,
                 Err(e) => {
                     gbl_println!(
-                        self.gbl_ops,
+                        gbl_ops,
                         "Failed to resolve partition '{}', skipping pre-FDR wipe ({:?})",
                         basename,
                         e
@@ -1654,7 +1809,7 @@ where
                 Ok(part_io) => part_io,
                 Err(e) => {
                     gbl_println!(
-                        self.gbl_ops,
+                        gbl_ops,
                         "Failed to locate partition '{}', skipping pre-FDR wipe ({:?})",
                         basename,
                         e
@@ -1671,10 +1826,10 @@ where
             );
 
             if let Err(e) =
-                self.schedule_task(&mut task, SnapshotMergeCancel::None, responder).await
+                self.schedule_task(gbl_ops, &mut task, SnapshotMergeCancel::None, responder).await
             {
                 gbl_println!(
-                    self.gbl_ops,
+                    gbl_ops,
                     "Failed to erase partition '{}', skipping pre-FDR wipe ({:?})",
                     basename,
                     e
@@ -1684,9 +1839,9 @@ where
     }
 }
 
-// See definition of [GblFastboot] for docs on lifetimes and generics parameters.
-impl<'a: 'c, 'b: 'c, 'c, G, B, P2, T, P, C, F> FastbootImplementation
-    for GblFastboot<'a, 'b, 'c, '_, G, B, P2, T, P, C, F>
+// See definition of [GblFastboot] and [GblFastbootState] for docs on lifetimes and generics.
+impl<'a: 'c, 'b: 'c, 'c, 'd, G, B, P2, T, P, C, F> FastbootImplementation
+    for GblFastboot<'d, G, GblFastbootState<'a, 'b, 'c, 'd, B, P2, T, P, C, F>>
 where
     G: GblOps<'a>,
     B: BlockIo,
@@ -1705,21 +1860,21 @@ where
         out: &mut [u8],
         _: impl InfoSender,
     ) -> CommandResult<usize> {
-        Ok(self.get_var_internal(var, args, out).await?.len())
+        Ok(self.state.get_var_internal(self.gbl_ops, var, args, out).await?.len())
     }
 
     async fn get_var_all(&mut self, mut resp: impl VarInfoSender) -> CommandResult<()> {
-        self.get_var_all_internal(&mut resp).await
+        self.state.get_var_all_internal(self.gbl_ops, &mut resp).await
     }
 
     async fn flash(&mut self, part: &str, mut responder: impl InfoSender) -> CommandResult<()> {
-        self.check_unlocked()?;
-        let disks = self.disks;
+        self.state.check_unlocked(self.gbl_ops)?;
+        let disks = self.state.disks;
 
         // Checks if we are flashing new GPT partition table.
-        if let Some((blk_idx, resize)) = self.parse_flash_gpt_args(part)? {
-            self.wait_partition_io(blk_idx, None).await?;
-            let (mut gpt, size) = self.take_download().ok_or("No GPT downloaded")?;
+        if let Some((blk_idx, resize)) = self.state.parse_flash_gpt_args(self.gbl_ops, part)? {
+            self.state.wait_partition_io(blk_idx, None).await?;
+            let (mut gpt, size) = self.state.take_download().ok_or("No GPT downloaded")?;
             responder.send_info("Updating GPT...").await?;
             return match disks[blk_idx].update_gpt(&mut gpt[..size], resize).await {
                 Err(Error::NotReady) => panic!("Should not be busy"),
@@ -1729,8 +1884,8 @@ where
         }
 
         let (part_io, fdr, snapshot_cancel) =
-            self.parse_and_get_partition_io::<ReadWrite>(part).await?;
-        let (data, sz) = self.take_download().ok_or("No download")?;
+            self.state.parse_and_get_partition_io::<ReadWrite>(self.gbl_ops, part).await?;
+        let (data, sz) = self.state.take_download().ok_or("No download")?;
         let mut task = Task::new(
             match is_sparse_image(&data) {
                 Ok(v) => TaskWorkload::FlashSparse(part_io.sub(0, v.data_size())?, data),
@@ -1738,20 +1893,20 @@ where
             },
             |f| write!(f, "flash:{part}"),
         );
-        self.schedule_task(&mut task, snapshot_cancel, &mut responder).await?;
+        self.state.schedule_task(self.gbl_ops, &mut task, snapshot_cancel, &mut responder).await?;
         if fdr == Fdr::Yes {
-            self.sync_tasks_and_fdr(&mut responder).await?;
+            self.state.sync_tasks_and_fdr(self.gbl_ops, &mut responder).await?;
         }
         Ok(())
     }
 
     async fn erase(&mut self, part: &str, mut responder: impl InfoSender) -> CommandResult<()> {
-        self.check_unlocked()?;
-        let disks = self.disks;
+        self.state.check_unlocked(self.gbl_ops)?;
+        let disks = self.state.disks;
 
         // Checks if we are erasing GPT partition table.
-        if let Some((blk_idx, _)) = self.parse_flash_gpt_args(part)? {
-            self.wait_partition_io(blk_idx, None).await?;
+        if let Some((blk_idx, _)) = self.state.parse_flash_gpt_args(self.gbl_ops, part)? {
+            self.state.wait_partition_io(blk_idx, None).await?;
             return match disks[blk_idx].erase_gpt().await {
                 Err(Error::NotReady) => panic!("Should not be busy"),
                 Err(Error::Unsupported) => Err("Block device is not for GPT".into()),
@@ -1760,14 +1915,14 @@ where
         }
 
         let (part_io, fdr, snapshot_cancel) =
-            self.parse_and_get_partition_io::<ReadWrite>(part).await?;
+            self.state.parse_and_get_partition_io::<ReadWrite>(self.gbl_ops, part).await?;
         let mut task = Task::new(
-            TaskWorkload::Erase(part_io, self.take_or_allocate_download_buffer().await),
+            TaskWorkload::Erase(part_io, self.state.take_or_allocate_download_buffer().await),
             |f| write!(f, "erase:{part}"),
         );
-        self.schedule_task(&mut task, snapshot_cancel, &mut responder).await?;
+        self.state.schedule_task(self.gbl_ops, &mut task, snapshot_cancel, &mut responder).await?;
         if fdr == Fdr::Yes {
-            self.sync_tasks_and_fdr(&mut responder).await?;
+            self.state.sync_tasks_and_fdr(self.gbl_ops, &mut responder).await?;
         }
         Ok(())
     }
@@ -1776,8 +1931,9 @@ where
         &mut self,
         responder: impl DownloadBuilder + InfoSender,
     ) -> CommandResult<()> {
-        self.get_download_buffer().await;
-        let buf = &mut self.current_download_buffer.as_mut().unwrap()[..];
+        self.state.get_download_buffer().await;
+        let Self { gbl_ops, state } = self;
+        let buf = &mut state.current_download_buffer.as_mut().unwrap()[..];
         let total = responder.total();
         if total > buf.len() {
             return Err(GblFastbootError::BufferTooSmall { size: buf.len(), needed: total });
@@ -1788,7 +1944,7 @@ where
 
         // CRC computation task.
         let crc = async {
-            let Some(crc) = self.expected_download_crc.take() else {
+            let Some(crc) = state.expected_download_crc.take() else {
                 return Ok(());
             };
             let mut hasher = crc32fast::Hasher::new();
@@ -1823,7 +1979,7 @@ where
                 while recv()? * 4 / total < i {
                     yield_now().await;
                 }
-                gbl_println!(self.gbl_ops, "\tDownloaded {}+%, {}/{total}", 25 * i, recv()?);
+                gbl_println!(gbl_ops, "\tDownloaded {}+%, {}/{total}", 25 * i, recv()?);
             }
             Ok::<(), Error>(())
         };
@@ -1831,27 +1987,28 @@ where
         let ((dl, crc), _) = join(join(download(&mut downloader, buf, &channel), crc), log).await;
         dl?;
         crc?;
-        self.current_download_size = total;
+        state.current_download_size = total;
         Ok(())
     }
 
     async fn upload(&mut self, responder: impl UploadBuilder + InfoSender) -> CommandResult<()> {
-        let Some(data_type) = self.stage_data_type.take() else {
+        let Some(data_type) = self.state.stage_data_type.take() else {
             // If the device has provided some custom OEM command with upload data, allow it
             // regardless of lock state. This can be necessary e.g. for authenticated unlock.
-            return self.upload_oem_data(responder).await;
+            return self.state.upload_oem_data(self.gbl_ops, responder).await;
         };
 
         // Our debug commands should always be gated behind device unlock.
-        self.check_unlocked()?;
+        self.state.check_unlocked(self.gbl_ops)?;
 
         let data = match data_type {
-            StageDataType::LoadedRamdisk => self.get_load_result()?.ramdisk,
-            StageDataType::LoadedFdt => self.get_load_result()?.fdt,
-            StageDataType::LoadedKernel => self.get_load_result()?.kernel,
+            StageDataType::LoadedRamdisk => self.state.get_load_result()?.ramdisk,
+            StageDataType::LoadedFdt => self.state.get_load_result()?.fdt,
+            StageDataType::LoadedKernel => self.state.get_load_result()?.kernel,
             StageDataType::Trace => {
-                self.gbl_trace = self.gbl_trace.take().or(trace::gbl_trace_take_buffer());
-                self.gbl_trace.as_ref().map(|(b, s)| &b[..*s]).ok_or("Trace unavailable")?
+                self.state.gbl_trace =
+                    self.state.gbl_trace.take().or(trace::gbl_trace_take_buffer());
+                self.state.gbl_trace.as_ref().map(|(b, s)| &b[..*s]).ok_or("Trace unavailable")?
             }
         };
         let mut uploader = responder.initiate_upload(data.len().try_into().unwrap()).await?;
@@ -1865,15 +2022,15 @@ where
         size: u32,
         mut responder: impl UploadBuilder + InfoSender,
     ) -> CommandResult<()> {
-        self.check_unlocked()?;
+        self.state.check_unlocked(self.gbl_ops)?;
         let (part_io, fdr, snapshot_cancel) =
-            self.parse_and_get_partition_io::<ReadOnly>(part).await?;
+            self.state.parse_and_get_partition_io::<ReadOnly>(self.gbl_ops, part).await?;
         // FDR or snapshot cancellation should never be requested for read-only - this would
         // indicate a bug in GBL.
         if fdr != Fdr::No || !matches!(snapshot_cancel, SnapshotMergeCancel::None) {
             return Err("Internal error: write side-effects requested during fetch".into());
         }
-        let buffer = self.get_download_buffer().await;
+        let buffer = self.state.get_download_buffer().await;
         // 4MB batches (chosen empirically) or as large as the download buffer permits.
         let batch_sz = min(4 * 1024 * 1024, buffer.len() / 2);
         let (mut read_buf, mut send_buf) = buffer.split_at_mut(batch_sz);
@@ -1902,23 +2059,23 @@ where
         mode: RebootMode,
         resp: impl InfoSender + OkaySender,
     ) -> CommandResult<Infallible> {
-        self.sync_tasks_and_reboot(mode, resp).await
+        self.state.sync_tasks_and_reboot(self.gbl_ops, mode, resp).await
     }
 
     async fn r#continue(&mut self, mut resp: impl InfoSender) -> CommandResult<()> {
-        self.sync_tasks(&mut resp, "Continue").await;
+        self.state.sync_tasks(self.gbl_ops, &mut resp, "Continue").await;
         Ok(())
     }
 
     async fn set_active(&mut self, slot: &str, mut resp: impl InfoSender) -> CommandResult<()> {
-        self.check_unlocked()?;
+        self.state.check_unlocked(self.gbl_ops)?;
         if slot.len() > 1 {
             return Err("Slot suffix must be one character".into());
         }
 
         let slot_ch = slot.chars().next().ok_or("Invalid slot")?;
-        self.set_active_slot(slot_ch, &mut resp).await?;
-        self.result.last_set_active_slot = Some(slot_ch);
+        self.state.set_active_slot(self.gbl_ops, slot_ch, &mut resp).await?;
+        self.state.result.last_set_active_slot = Some(slot_ch);
         Ok(())
     }
 
@@ -1927,16 +2084,16 @@ where
         cmd: &str,
         mut responder: impl InfoSender,
     ) -> CommandResult<()> {
-        self.sync_tasks(&mut responder, "snapshot-update").await;
+        self.state.sync_tasks(self.gbl_ops, &mut responder, "snapshot-update").await;
         match cmd.trim() {
             "" => {
-                let status = self.snapshot_merge_status().await?;
+                let status = self.state.snapshot_merge_status(self.gbl_ops).await?;
                 responder.send_info(status.into()).await?;
                 Ok(())
             }
             "cancel" => {
-                self.check_unlocked()?;
-                self.cancel_snapshot_merge().await
+                self.state.check_unlocked(self.gbl_ops)?;
+                self.state.cancel_snapshot_merge(self.gbl_ops).await
             }
             _ => Err("Invalid parameter to snapshot-update".into()),
         }
@@ -1949,19 +2106,19 @@ where
     ) -> CommandResult<()> {
         let mut args = cmd_str.split(' ');
         let cmd = args.next().ok_or("Missing command")?;
-        self.stage_data_type = None;
+        self.state.stage_data_type = None;
         match cmd {
             "gbl-sync-tasks" => {
-                self.async_info_sent = false;
-                self.oem_sync_tasks(&mut responder).await
+                self.state.async_info_sent = false;
+                self.state.oem_sync_tasks(self.gbl_ops, &mut responder).await
             }
             "gbl-enable-async-task" => {
-                self.async_info_sent = false;
-                self.enable_async_task = true;
+                self.state.async_info_sent = false;
+                self.state.enable_async_task = true;
                 Ok(())
             }
             "gbl-disable-async-task" => {
-                self.enable_async_task = false;
+                self.state.enable_async_task = false;
                 Ok(())
             }
             "gbl-set-download-crc" => {
@@ -1969,22 +2126,22 @@ where
                 // upstream, i.e. download:<size>:<crc>
                 let crc = FromHexStr::try_parse_next(&mut args)
                     .map_err(|_| GblFastbootError::from("Missing CRC32 value"))?;
-                self.expected_download_crc = Some(crc);
+                self.state.expected_download_crc = Some(crc);
                 Ok(())
             }
             "gbl-unset-download-crc" => {
-                self.expected_download_crc = None;
+                self.state.expected_download_crc = None;
                 Ok(())
             }
             "gbl-unset-default-block" => {
-                self.default_block = None;
+                self.state.default_block = None;
                 Ok(())
             }
             "gbl-set-default-block" => {
                 let id: usize = FromHexStr::try_parse_next(&mut args)
                     .map_err(|_| GblFastbootError::from("Missing block device ID"))?;
-                self.disks.get(id).ok_or("Out of range")?;
-                self.default_block = Some(id);
+                self.state.disks.get(id).ok_or("Out of range")?;
+                self.state.default_block = Some(id);
                 responder
                     .send_formatted_info(|f| write!(f, "Default block device: {id:#x}").unwrap())
                     .await?;
@@ -1992,12 +2149,12 @@ where
             }
             #[cfg(feature = "fuchsia")]
             "add-staged-bootloader-file" => {
-                self.check_unlocked()?;
+                self.state.check_unlocked(self.gbl_ops)?;
                 let file_name = next_arg(&mut args).ok_or("Missing file name")?;
-                self.add_staged_bootloader_file(file_name).await?;
+                self.state.add_staged_bootloader_file(self.gbl_ops, file_name).await?;
                 Ok(())
             }
-            "gbl-partition-info" => self.oem_dump_partition_info(responder).await,
+            "gbl-partition-info" => self.state.oem_dump_partition_info(responder).await,
             "gbl-sync-gpt" => {
                 let mut args = args.filter(|v| !v.is_empty());
                 let blk_arg = args.next().ok_or("Missing block device ID")?;
@@ -2005,11 +2162,11 @@ where
                     return Err("Too many arguments".into());
                 }
                 let blk_idx: usize = FromHexStr::try_from_hex_str(blk_arg)?;
-                let blk = self.disks.get(blk_idx).ok_or("Invalid block index")?;
+                let blk = self.state.disks.get(blk_idx).ok_or("Invalid block index")?;
                 if !blk.is_gpt() {
                     return Err("Block device is not for GPT".into());
                 }
-                self.sync_tasks(&mut responder, "GPT sync").await;
+                self.state.sync_tasks(self.gbl_ops, &mut responder, "GPT sync").await;
                 while matches!(blk.num_partitions(), Err(Error::NotReady)) {
                     yield_now().await;
                 }
@@ -2022,30 +2179,36 @@ where
                 Ok(())
             }
             "gbl-add-cmdline" => {
-                self.check_unlocked()?;
+                self.state.check_unlocked(self.gbl_ops)?;
                 let arg = next_arg(&mut args).ok_or("Missing cmdline arg")?;
-                Ok(self.boot_item_container()?.append_item(BootItem::Cmdline, arg.as_bytes())?)
+                Ok(self
+                    .state
+                    .boot_item_container()?
+                    .append_item(BootItem::Cmdline, arg.as_bytes())?)
             }
             "gbl-add-bootconfig" => {
-                self.check_unlocked()?;
+                self.state.check_unlocked(self.gbl_ops)?;
                 let arg = next_arg(&mut args).ok_or("Missing bootconfig arg")?;
-                Ok(self.boot_item_container()?.append_item(BootItem::Bootconfig, arg.as_bytes())?)
+                Ok(self
+                    .state
+                    .boot_item_container()?
+                    .append_item(BootItem::Bootconfig, arg.as_bytes())?)
             }
             "gbl-add-staged-data" => {
-                self.check_unlocked()?;
+                self.state.check_unlocked(self.gbl_ops)?;
                 let arg = next_arg(&mut args).ok_or("Missing tag")?;
-                let (data, sz) = self.take_download().ok_or("No download")?;
-                Ok(self.boot_item_container()?.append_blob(arg, &data[..sz])?)
+                let (data, sz) = self.state.take_download().ok_or("No download")?;
+                Ok(self.state.boot_item_container()?.append_blob(arg, &data[..sz])?)
             }
             "gbl-stage" => {
-                self.check_unlocked()?;
-                self.stage_data_type = Some(self.gbl_stage(args)?);
+                self.state.check_unlocked(self.gbl_ops)?;
+                self.state.stage_data_type = Some(self.state.gbl_stage(args)?);
                 Ok(())
             }
             "gbl-pause-fastboot-after-load" => {
-                self.check_unlocked()?;
+                self.state.check_unlocked(self.gbl_ops)?;
                 let v: u64 = FromHexStr::try_from_hex_str(next_arg(&mut args).unwrap_or("1"))?;
-                self.result.pause_in_fastboot = v != 0;
+                self.state.result.pause_in_fastboot = v != 0;
                 Ok(())
             }
             #[cfg(feature = "gbl_dev")]
@@ -2062,19 +2225,21 @@ where
         command: StreamCommand<&str>,
         mut responder: impl InfoSender,
     ) -> CommandResult<()> {
-        self.check_unlocked()?;
-        let (part_io, fdr, snapshot_cancel) =
-            self.parse_and_get_partition_io::<ReadWrite>(command.partition.as_ref()).await?;
+        self.state.check_unlocked(self.gbl_ops)?;
+        let (part_io, fdr, snapshot_cancel) = self
+            .state
+            .parse_and_get_partition_io::<ReadWrite>(self.gbl_ops, command.partition.as_ref())
+            .await?;
         let mut task = match command.operation {
             StreamOperation::Fill { size, payload } => {
                 let io = part_io.sub(command.offset, size)?;
-                let buffer = self.take_or_allocate_download_buffer().await;
+                let buffer = self.state.take_or_allocate_download_buffer().await;
                 Task::new(TaskWorkload::Fill(io, buffer, payload), |f| {
                     write!(f, "stream-fill:{}:{:#x}:{:#x}", command.partition, command.offset, size)
                 })
             }
             StreamOperation::Flash { checksum } => {
-                let (download, size) = self.take_download().ok_or("No downloaded data")?;
+                let (download, size) = self.state.take_download().ok_or("No downloaded data")?;
                 let io = part_io.sub(command.offset, size.try_into()?)?;
                 let mut hasher = crc32fast::Hasher::new();
                 for v in download[..size].chunks(KiB!(4)) {
@@ -2095,29 +2260,29 @@ where
             }
         };
 
-        self.schedule_task(&mut task, snapshot_cancel, &mut responder).await?;
+        self.state.schedule_task(self.gbl_ops, &mut task, snapshot_cancel, &mut responder).await?;
         if fdr == Fdr::Yes {
-            self.sync_tasks_and_fdr(&mut responder).await?;
+            self.state.sync_tasks_and_fdr(self.gbl_ops, &mut responder).await?;
         }
         Ok(())
     }
 
     async fn boot(&mut self, resp: impl InfoSender + OkaySender) -> CommandResult<()> {
         // Post-load fastboot continues with the images loaded before it.
-        if self.data.load_result.is_some() {
+        if self.state.data.load_result.is_some() {
             return Err("Not supported after images are loaded".into());
         }
-        self.check_unlocked()?;
-        let (img, sz) = self.take_download().ok_or("No boot image staged")?;
+        self.state.check_unlocked(self.gbl_ops)?;
+        let (img, sz) = self.state.take_download().ok_or("No boot image staged")?;
         // Re-sync preloaded partitions. Device state or disk content might have changed due to
         // flashing etc.
         self.gbl_ops.sync_partition_buffer(true)?;
         #[cfg(feature = "fuchsia")]
         if is_fuchsia_fastboot_boot_image(&img[..sz]) {
-            return self.boot_fuchsia(&img[..sz], resp).await;
+            return self.state.boot_fuchsia(self.gbl_ops, &img[..sz], resp).await;
         }
 
-        self.boot_android(&img[..sz], resp).await
+        self.state.boot_android(self.gbl_ops, &img[..sz], resp).await
     }
 
     async fn flashing_write_lock_state(
@@ -2161,14 +2326,14 @@ where
             //
             // For dev boards that do not yet implement key rotation, this is necessary to wipe
             // user data and essentially performs a non-secure FDR.
-            self.wipe_fdr_partitions(&mut responder).await;
+            self.state.wipe_fdr_partitions(self.gbl_ops, &mut responder).await;
 
             // 2. Perform FDR
             //
             // This is security-critical - we must not allow any user data to leak across lock
             // states in either direction. FDR rotates encryption keys to irreversably shred any
             // user data.
-            self.sync_tasks_and_fdr(&mut responder).await?;
+            self.state.sync_tasks_and_fdr(self.gbl_ops, &mut responder).await?;
         }
 
         Ok(self.gbl_ops.avb_write_lock_state(lock_type, lock_state)?)
@@ -2183,18 +2348,21 @@ where
         mut args: impl Iterator<Item = &'_ CStr> + Clone,
         responder: impl InfoSender + OkaySender + FailSender,
     ) -> CommandResult<CommandExecType> {
-        let current_download_size =
-            self.current_download_buffer.as_ref().map_or(0, |_| self.current_download_size);
+        let current_download_size = self
+            .state
+            .current_download_buffer
+            .as_ref()
+            .map_or(0, |_| self.state.current_download_size);
         let res = self.gbl_ops.fastboot_command_exec(
             args.clone(),
-            self.current_download_buffer.as_mut().map_or(&mut [][..], |v| &mut v[..]),
+            self.state.current_download_buffer.as_mut().map_or(&mut [][..], |v| &mut v[..]),
             current_download_size,
             responder,
         )?;
         if matches!(res, CommandExecType::CustomImpl)
             && [Some(c"flash"), Some(c"erase")].contains(&args.next())
         {
-            self.sync_gpts().await;
+            self.state.sync_gpts(self.gbl_ops).await;
         }
         Ok(res)
     }
@@ -2376,7 +2544,7 @@ pub(crate) async fn run_gbl_fastboot<'a: 'c, 'b: 'c, 'c>(
     let disks = gbl_ops.disks();
     let mut fb = GblFastboot::new(gbl_ops, disks, Task::run, &tasks, buffer_pool, data);
     fb.run(transports, tcp).await;
-    fb.result
+    fb.state.result
 }
 
 /// Runs GBL fastboot on the given transports' channels with N stack allocated worker tasks.
@@ -2426,7 +2594,7 @@ pub(crate) async fn run_gbl_fastboot_stack<'a, const N: usize>(
     let disks = gbl_ops.disks();
     let mut fb = GblFastboot::new(gbl_ops, disks, Task::run, &tasks, &buffer_pool, data);
     fb.run(transports, tcp).await;
-    fb.result
+    fb.state.result
 }
 
 /// Pre-generates a Fuchsia Fastboot MDNS service broadcast packet.
@@ -2580,7 +2748,11 @@ pub(crate) mod test {
         expected: &str,
     ) {
         let resp: TestResponder = Default::default();
-        let args_c = args.split(':').map(|v| CString::new(v).unwrap()).collect::<Vec<_>>();
+        let args_c = if args.is_empty() {
+            Vec::new()
+        } else {
+            args.split(':').map(|v| CString::new(v).unwrap()).collect::<Vec<_>>()
+        };
         let args_c = args_c.iter().map(|v| v.as_c_str());
         let var_c = CString::new(var).unwrap();
         let mut out = vec![0u8; MAX_RESPONSE_SIZE];
@@ -2596,7 +2768,11 @@ pub(crate) mod test {
         args: &str,
     ) {
         let resp: TestResponder = Default::default();
-        let args_c = args.split(':').map(|v| CString::new(v).unwrap()).collect::<Vec<_>>();
+        let args_c = if args.is_empty() {
+            Vec::new()
+        } else {
+            args.split(':').map(|v| CString::new(v).unwrap()).collect::<Vec<_>>()
+        };
         let args_c = args_c.iter().map(|v| v.as_c_str());
         let var_c = CString::new(var).unwrap();
         let mut out = vec![0u8; MAX_RESPONSE_SIZE];
@@ -2648,20 +2824,35 @@ pub(crate) mod test {
         block_id: Option<usize>,
         mode: ResolveMode,
     ) -> Result<(Option<&'a str>, Vec<(u32, String)>), Error> {
-        let dl_buffers = Shared::from(vec![Some(vec![0u8; KiB!(128)]); 1]);
+        let storage = raw_partitions_storage(parts);
+        let mut gbl_ops = FakeGblOps::new(&storage);
+        resolve_slotted_partition_with_ops(&mut gbl_ops, target, block_id, mode)
+    }
+
+    /// Creates a storage with one 4 KiB raw partition per name in `parts`.
+    fn raw_partitions_storage(parts: &[&CStr]) -> FakeGblOpsStorage {
         let mut storage = FakeGblOpsStorage::default();
         for part in parts {
             storage.add_raw_device(part, vec![0u8; KiB!(4)]);
         }
-        let mut gbl_ops = FakeGblOps::new(&storage);
+        storage
+    }
+
+    /// Same as [resolve_slotted_partition] but uses the caller's (possibly customized) `gbl_ops`.
+    fn resolve_slotted_partition_with_ops<'a>(
+        gbl_ops: &mut FakeGblOps<'_>,
+        target: Option<&'a str>,
+        block_id: Option<usize>,
+        mode: ResolveMode,
+    ) -> Result<(Option<&'a str>, Vec<(u32, String)>), Error> {
+        let dl_buffers = Shared::from(vec![Some(vec![0u8; KiB!(128)]); 1]);
         let tasks = vec![].into();
         let parts = gbl_ops.disks();
         let boot_buffer = Default::default();
-        let mut gbl_fb =
-            GblFastboot::new(&mut gbl_ops, parts, Task::run, &tasks, &dl_buffers, boot_buffer);
+        let gbl_fb = GblFastboot::new(gbl_ops, parts, Task::run, &tasks, &dl_buffers, boot_buffer);
 
         let (basename, block_ids_and_parts) =
-            gbl_fb.resolve_slotted_partitions(target, block_id, mode)?;
+            gbl_fb.state.resolve_slotted_partitions(gbl_fb.gbl_ops, target, block_id, mode)?;
 
         // Convert the result into a format that's easier for tests to validate.
         let mut result = Vec::new();
@@ -2687,6 +2878,19 @@ pub(crate) mod test {
                 .unwrap();
         assert_eq!(basename, Some("boot"));
         assert_eq!(parts, vec![(0, "boot_a".to_string())]);
+    }
+
+    #[test]
+    fn test_resolve_slotted_partitions_non_slot_suffix() {
+        let (basename, parts) = resolve_slotted_partition(
+            &[c"protect_f"],
+            Some("protect_f"),
+            None,
+            ResolveMode::CurrentSlot,
+        )
+        .unwrap();
+        assert_eq!(basename, Some("protect_f"));
+        assert_eq!(parts, vec![(0, "protect_f".to_string())]);
     }
 
     #[test]
@@ -2750,8 +2954,132 @@ pub(crate) mod test {
                 None,
                 ResolveMode::CurrentSlot
             ),
-            Err(Error::NotFound)
+            Err(Error::PartitionNotFound)
         );
+    }
+
+    #[test]
+    fn test_resolve_slotted_partitions_slot_missing() {
+        // `boot_ab` requires every device slot; only `boot_a` exists.
+        assert_eq!(
+            resolve_slotted_partition(&[c"boot_a"], Some("boot_ab"), None, ResolveMode::AllSlots),
+            Err(Error::PartitionSlotMissing('b'))
+        );
+        // Current slot is `a` but only `boot_b` exists.
+        assert_eq!(
+            resolve_slotted_partition(&[c"boot_b"], Some("boot"), None, ResolveMode::CurrentSlot),
+            Err(Error::PartitionSlotMissing('a'))
+        );
+    }
+
+    #[test]
+    fn test_resolve_slotted_partitions_many_slots() {
+        let four_slots = [Ok(slot('a')), Ok(slot('b')), Ok(slot('c')), Ok(slot('d'))];
+
+        let storage = raw_partitions_storage(&[c"boot_a", c"boot_b", c"boot_c", c"boot_d"]);
+        let mut gbl_ops = FakeGblOps::new(&storage);
+        gbl_ops.slot_count = Some(Ok(4));
+        gbl_ops.slot_infos = four_slots.to_vec();
+        // Current-slot resolution only needs the current slot, regardless of slot count.
+        let (basename, resolved) = resolve_slotted_partition_with_ops(
+            &mut gbl_ops,
+            Some("boot"),
+            None,
+            ResolveMode::CurrentSlot,
+        )
+        .unwrap();
+        assert_eq!(basename, Some("boot"));
+        assert_eq!(resolved, vec![(0, "boot_a".to_string())]);
+        // `_ab` means every device slot; more than `MAX_IO_PARTS` cannot be represented.
+        assert_eq!(
+            resolve_slotted_partition_with_ops(
+                &mut gbl_ops,
+                Some("boot_ab"),
+                None,
+                ResolveMode::AllSlots
+            ),
+            Err(Error::TooManyPartitions(MAX_IO_PARTS))
+        );
+
+        // A slot without the partition is reported as missing.
+        let storage = raw_partitions_storage(&[c"boot_a", c"boot_b"]);
+        let mut gbl_ops = FakeGblOps::new(&storage);
+        gbl_ops.slot_count = Some(Ok(4));
+        gbl_ops.slot_infos = four_slots.to_vec();
+        assert_eq!(
+            resolve_slotted_partition_with_ops(
+                &mut gbl_ops,
+                Some("boot_ab"),
+                None,
+                ResolveMode::AllSlots
+            ),
+            Err(Error::PartitionSlotMissing('c'))
+        );
+    }
+
+    #[test]
+    fn test_resolve_slotted_partitions_other_slot_error() {
+        let broken_slot_b = [Ok(slot('a')), Err(Error::Other(Some("slot b broken")))];
+
+        // A failing query for a non-current slot must not affect current-slot resolution.
+        let storage = raw_partitions_storage(&[c"boot_a", c"boot_b"]);
+        let mut gbl_ops = FakeGblOps::new(&storage);
+        gbl_ops.slot_infos = broken_slot_b.to_vec();
+        let (basename, resolved) = resolve_slotted_partition_with_ops(
+            &mut gbl_ops,
+            Some("boot"),
+            None,
+            ResolveMode::CurrentSlot,
+        )
+        .unwrap();
+        assert_eq!(basename, Some("boot"));
+        assert_eq!(resolved, vec![(0, "boot_a".to_string())]);
+
+        // Probing the other slots (needed only when the current slot is missing) propagates it.
+        let storage = raw_partitions_storage(&[c"boot_b"]);
+        let mut gbl_ops = FakeGblOps::new(&storage);
+        gbl_ops.slot_infos = broken_slot_b.to_vec();
+        assert_eq!(
+            resolve_slotted_partition_with_ops(
+                &mut gbl_ops,
+                Some("boot"),
+                None,
+                ResolveMode::CurrentSlot
+            ),
+            Err(Error::Other(Some("slot b broken")))
+        );
+    }
+
+    #[test]
+    fn test_resolve_slotted_partitions_exact_match_without_slotting() {
+        // Without slotting a trailing `_[a-z]` is never a slot suffix.
+        for slot_count in [Ok(0), Err(Error::Unsupported), Err(Error::NotFound)] {
+            let dl_buffers = Shared::from(vec![Some(vec![0u8; KiB!(128)]); 1]);
+            let mut storage = FakeGblOpsStorage::default();
+            storage.add_raw_device(c"boot_a", vec![0u8; KiB!(4)]);
+            let mut gbl_ops = FakeGblOps::new(&storage);
+            gbl_ops.slot_count = Some(slot_count);
+            let tasks = vec![].into();
+            let parts = gbl_ops.disks();
+            let gbl_fb = GblFastboot::new(
+                &mut gbl_ops,
+                parts,
+                Task::run,
+                &tasks,
+                &dl_buffers,
+                Default::default(),
+            );
+            let (basename, _) = gbl_fb
+                .state
+                .resolve_slotted_partitions(
+                    gbl_fb.gbl_ops,
+                    Some("boot_a"),
+                    None,
+                    ResolveMode::CurrentSlot,
+                )
+                .unwrap();
+            assert_eq!(basename, Some("boot_a"));
+        }
     }
 
     #[test]
@@ -3127,6 +3455,352 @@ pub(crate) mod test {
                 "stream-segment-size: 0x1000"
             ],
         );
+    }
+
+    /// Helper to construct `(Vec<CString>, CString)` entries for `FakeGblOps::custom_fastboot_vars`.
+    fn custom_var_entry(args: &[&str], val: &str) -> (Vec<CString>, CString) {
+        (args.iter().map(|s| CString::new(*s).unwrap()).collect(), CString::new(val).unwrap())
+    }
+
+    #[test]
+    fn test_virtual_partition_vars_getvar_and_getvar_all() {
+        let dl_buffers = Shared::from(vec![Some(vec![0u8; KiB!(128)]); 1]);
+        let mut load_buffer = AlignedBuffer::new(MiB!(8), KERNEL_ALIGNMENT);
+        let mut storage = FakeGblOpsStorage::default();
+        storage.add_gpt_device(include_bytes!("../../../libstorage/test/gpt_test_1.bin"));
+        storage.add_gpt_device(include_bytes!("../../../libstorage/test/gpt_test_2.bin"));
+        storage.add_raw_device(c"raw_0", [0xaau8; KiB!(4)]);
+        storage.add_raw_device(c"raw_1", [0x55u8; KiB!(8)]);
+        storage.add_raw_device(c"userdata", [0u8; KiB!(8)]);
+        storage.add_raw_device(c"super", *include_bytes!("../../../liblp/testdata/super.bin"));
+        // Partially slotted partition: only slot `a` exists.
+        storage.add_raw_device(c"partial_a", [0u8; KiB!(4)]);
+        let mut gbl_ops = FakeGblOps::new(&storage);
+        gbl_ops
+            .partition_type
+            .insert("userdata".to_owned(), FastbootPartitionType::from_slice(b"ext4").unwrap());
+        gbl_ops.custom_fastboot_vars = vec![
+            // Valid custom scalar and virtual partition variables (split and ':'-concatenated).
+            custom_var_entry(&["product"], "test-board"),
+            custom_var_entry(&["has-slot", "bootloader"], "yes"),
+            custom_var_entry(&["has-slot:radio"], "yes"),
+            custom_var_entry(&["has-slot", "virtual_unslotted"], "no"),
+            custom_var_entry(&["partition-size", "bootloader_a"], "0x1000000"),
+            custom_var_entry(&["partition-type:bootloader_a"], "raw"),
+            custom_var_entry(
+                &["partition-guid", "bootloader_a"],
+                "11111111-2222-3333-4444-555555555555",
+            ),
+            custom_var_entry(&["partition-start:bootloader_a"], "0x8000"),
+            custom_var_entry(&["partition-size", "system_a"], "0x2000000"),
+            custom_var_entry(&["partition-type", "system_a"], "raw"),
+            // Poison entries for GBL-managed GPT, raw block, and `super` dynamic partitions: must
+            // be ignored in `getvar` (even when GBL returns an error) and filtered in `getvar all`.
+            custom_var_entry(&["has-slot", "boot"], "no"),
+            custom_var_entry(&["has-slot", "boot_a"], "yes"),
+            custom_var_entry(&["has-slot", "raw_0"], "yes"),
+            custom_var_entry(&["has-slot", "system"], "no"),
+            custom_var_entry(&["partition-size", "boot"], "0xdead"),
+            custom_var_entry(&["partition-size:boot_a"], "0xdead"),
+            custom_var_entry(&["partition-size", "boot_ab"], "0xdead"),
+            custom_var_entry(&["partition-size", "partial_ab"], "0xdead"),
+            custom_var_entry(&["partition-size", "userdata"], "0xdead"),
+            custom_var_entry(&["partition-type:boot_a"], "vendor-override"),
+            custom_var_entry(&["partition-type", "userdata"], "vendor-override"),
+            custom_var_entry(&["partition-guid", "boot_a"], "00000000-0000-0000-0000-000000000000"),
+            custom_var_entry(&["partition-guid", "raw_0"], "00000000-0000-0000-0000-000000000000"),
+            custom_var_entry(&["partition-start", "boot_a"], "0xdead"),
+            custom_var_entry(&["partition-start:raw_0"], "0xdead"),
+            // Poison entries for reserved scalar / security-sensitive GBL variables.
+            custom_var_entry(&["unlocked"], "yes"),
+            custom_var_entry(&["unlocked-critical"], "yes"),
+            custom_var_entry(&["is-userspace"], "yes"),
+            custom_var_entry(&["max-download-size"], "0xdead"),
+            custom_var_entry(&["current-slot"], "z"),
+            custom_var_entry(&["gbl-default-block"], "0xdead"),
+            // Extended '/' syntax and malformed args: must be rejected in `getvar` and filtered
+            // out in `getvar all`.
+            custom_var_entry(&["partition-size:/0"], "0xdead"),
+            custom_var_entry(&["partition-size", "bootloader_a/0"], "0xdead"),
+            custom_var_entry(&["partition-type", "bootloader_a/0"], "vendor-override"),
+            custom_var_entry(&["has-slot", "bootloader/0"], "yes"),
+            custom_var_entry(&["has-slot", ""], "no"),
+            custom_var_entry(&["has-slot:"], "no"),
+        ];
+
+        let tasks = vec![].into();
+        let parts = gbl_ops.disks();
+        let mut gbl_fb = GblFastboot::new(
+            &mut gbl_ops,
+            parts,
+            Task::run,
+            &tasks,
+            &dl_buffers,
+            GblFbData { boot_buffer: load_buffer.as_mut().into(), ..Default::default() },
+        );
+
+        // Custom scalar and virtual/dynamic partition vars fall back to `fastboot_variable`.
+        check_var(&mut gbl_fb, "product", "", "test-board");
+        check_var(&mut gbl_fb, "has-slot", "bootloader", "yes");
+        check_var(&mut gbl_fb, "has-slot", "radio", "yes");
+        check_var(&mut gbl_fb, "has-slot", "virtual_unslotted", "no");
+        check_var(&mut gbl_fb, "partition-size", "bootloader_a", "0x1000000");
+        check_var(&mut gbl_fb, "partition-type", "bootloader_a", "raw");
+        check_var(
+            &mut gbl_fb,
+            "partition-guid",
+            "bootloader_a",
+            "11111111-2222-3333-4444-555555555555",
+        );
+        check_var(&mut gbl_fb, "partition-start", "bootloader_a", "0x8000");
+        check_var(&mut gbl_fb, "partition-size", "system_a", "0x2000000");
+        check_var(&mut gbl_fb, "partition-type", "system_a", "raw");
+        check_var_failure(&mut gbl_fb, "has-slot", "unknown_virtual");
+        check_var_failure(&mut gbl_fb, "partition-size", "unknown_virtual");
+
+        // Wire-level `process_next_command` exercises real argument splitting (including 0-arg
+        // scalar `getvar:product` and missing-arg `getvar:has-slot`).
+        for (cmd, expected_prefix) in [
+            (&b"getvar:product"[..], &b"OKAYtest-board"[..]),
+            (&b"getvar:has-slot:bootloader"[..], &b"OKAYyes"[..]),
+            (&b"getvar:has-slot"[..], &b"FAIL"[..]),
+        ] {
+            let listener: SharedTestListener = Default::default();
+            listener.add_transport_input(cmd);
+            block_on(process_next_command(&mut &listener, &mut gbl_fb)).unwrap();
+            let out = listener.transport_out_queue();
+            assert!(out[0].starts_with(expected_prefix), "cmd {cmd:?} -> {:?}", out[0]);
+        }
+
+        // GBL-managed GPT, raw block, `super` dynamic, and reserved scalar variables never fall
+        // back to platform `custom_fastboot_vars`.
+        check_var(&mut gbl_fb, "unlocked", "", "no");
+        check_var(&mut gbl_fb, "unlocked-critical", "", "no");
+        check_var(&mut gbl_fb, "is-userspace", "", "no");
+        check_var(&mut gbl_fb, "current-slot", "", "a");
+        check_var(&mut gbl_fb, "gbl-default-block", "", "None");
+        check_var(&mut gbl_fb, "has-slot", "boot", "yes");
+        // `boot_a` is not in the has-slot table but exists on disk: no vendor fallback.
+        check_var_failure(&mut gbl_fb, "has-slot", "boot_a");
+        check_var(&mut gbl_fb, "has-slot", "raw_0", "no");
+        check_var(&mut gbl_fb, "has-slot", "system", "yes");
+        check_var(&mut gbl_fb, "partition-size", "boot", "0x2000");
+        check_var(&mut gbl_fb, "partition-size", "boot_a", "0x2000");
+        // `boot_a` (0x2000) != `boot_b` (0x3000) in `gpt_test_1.bin`: GBL returns an error other
+        // than `PartitionNotFound` without falling back to platform's `0xdead`.
+        check_var_failure(&mut gbl_fb, "partition-size", "boot_ab");
+        // `partial_b` is missing: `PartitionSlotMissing`, not `PartitionNotFound`, so no fallback.
+        check_var(&mut gbl_fb, "partition-size", "partial", "0x1000");
+        check_var_failure(&mut gbl_fb, "partition-size", "partial_ab");
+        check_var(&mut gbl_fb, "partition-size", "userdata", "0x2000");
+        check_var(&mut gbl_fb, "partition-type", "boot_a", "raw");
+        check_var(&mut gbl_fb, "partition-type", "userdata", "ext4");
+        check_var(&mut gbl_fb, "partition-guid", "boot_a", "42aaac2e-37e3-43ba-9930-42dfa96e6334");
+        // `raw_0` exists but is not a GPT partition: error without vendor fallback.
+        check_var_failure(&mut gbl_fb, "partition-guid", "raw_0");
+        check_var(&mut gbl_fb, "partition-start", "boot_a", "0x4400");
+        check_var(&mut gbl_fb, "partition-start", "raw_0", "0x0");
+
+        // Raw block device syntax is served natively; other extended '/' syntax and malformed
+        // args fail without falling back to platform's poison entries.
+        let disk_size = include_bytes!("../../../libstorage/test/gpt_test_1.bin").len();
+        check_var(&mut gbl_fb, "partition-size", "/0", &format!("{disk_size:#x}"));
+        check_var_failure(&mut gbl_fb, "partition-size", "bootloader_a/0");
+        check_var_failure(&mut gbl_fb, "partition-type", "bootloader_a/0");
+        check_var_failure(&mut gbl_fb, "has-slot", "bootloader/0");
+        check_var_failure(&mut gbl_fb, "has-slot", "");
+        check_var_failure(&mut gbl_fb, "has-slot", ":");
+
+        // `gbl-default-block` is served natively whether or not a default block is set. Reset it
+        // afterwards so partition lookups below search all disks.
+        gbl_fb.state.default_block = Some(1);
+        check_var(&mut gbl_fb, "gbl-default-block", "", "0x1");
+        gbl_fb.state.default_block = None;
+
+        // `getvar all` includes custom/virtual entries and filters out GBL-managed / malformed
+        // platform entries.
+        let mut logger = TestVarSender(vec![]);
+        block_on(gbl_fb.get_var_all(&mut logger)).unwrap();
+        for expected in [
+            "product: test-board",
+            "gbl-default-block: None",
+            "has-slot:bootloader: yes",
+            "has-slot:radio: yes",
+            "has-slot:virtual_unslotted: no",
+            "partition-size:bootloader_a: 0x1000000",
+            "partition-type:bootloader_a: raw",
+            "partition-guid:bootloader_a: 11111111-2222-3333-4444-555555555555",
+            "partition-start:bootloader_a: 0x8000",
+            "partition-size:system_a: 0x2000000",
+            "partition-type:system_a: raw",
+        ] {
+            assert!(logger.0.iter().any(|v| v == expected), "missing expected var: {expected}");
+        }
+        for forbidden in [
+            "has-slot:boot: no",
+            "has-slot:boot_a: yes",
+            "has-slot:raw_0: yes",
+            "has-slot:system: no",
+            "partition-size:boot: 0xdead",
+            "partition-size:boot_a: 0xdead",
+            "partition-size:boot_ab: 0xdead",
+            "partition-size:partial_ab: 0xdead",
+            "partition-size:userdata: 0xdead",
+            "partition-type:boot_a: vendor-override",
+            "partition-type:userdata: vendor-override",
+            "partition-guid:boot_a: 00000000-0000-0000-0000-000000000000",
+            "partition-guid:raw_0: 00000000-0000-0000-0000-000000000000",
+            "partition-start:boot_a: 0xdead",
+            "partition-start:raw_0: 0xdead",
+            "unlocked: yes",
+            "unlocked-critical: yes",
+            "is-userspace: yes",
+            "max-download-size: 0xdead",
+            "current-slot: z",
+            "gbl-default-block: 0xdead",
+            "partition-size:/0: 0xdead",
+            "partition-size:bootloader_a/0: 0xdead",
+            "partition-type:bootloader_a/0: vendor-override",
+            "has-slot:bootloader/0: yes",
+            "has-slot:: no",
+        ] {
+            assert!(!logger.0.iter().any(|v| v == forbidden), "unexpected var leaked: {forbidden}");
+        }
+
+        // Security-critical AVB failures must still fail in `getvar` and be suppressed in
+        // `getvar all` rather than falling back to vendor `unlocked: yes`.
+        gbl_fb.gbl_ops.avb_device_status = avb::IoError::NotImplemented.into();
+        check_var_failure(&mut gbl_fb, "unlocked", "");
+        check_var_failure(&mut gbl_fb, "unlocked-critical", "");
+        let mut logger = TestVarSender(vec![]);
+        block_on(gbl_fb.get_var_all(&mut logger)).unwrap();
+        assert!(!logger.0.iter().any(|v| v.starts_with("unlocked:")));
+        assert!(!logger.0.iter().any(|v| v.starts_with("unlocked-critical:")));
+    }
+
+    #[test]
+    fn test_virtual_partition_has_slot_when_slotting_unsupported() {
+        let dl_buffers = Shared::from(vec![Some(vec![0u8; KiB!(128)]); 1]);
+        let mut load_buffer = AlignedBuffer::new(MiB!(8), KERNEL_ALIGNMENT);
+        let mut storage = FakeGblOpsStorage::default();
+        storage.add_gpt_device(include_bytes!("../../../libstorage/test/gpt_test_1.bin"));
+        storage.add_raw_device(c"raw_0", [0xaau8; KiB!(4)]);
+        storage.add_raw_device(c"super", *include_bytes!("../../../liblp/testdata/super.bin"));
+        let mut gbl_ops = FakeGblOps::new(&storage);
+        gbl_ops.custom_fastboot_vars = vec![
+            custom_var_entry(&["partition-size", "bootloader"], "0x1000000"),
+            // Poison vendor entries: without slotting GBL answers `no` for every `has-slot`.
+            custom_var_entry(&["has-slot", "bootloader"], "yes"),
+            custom_var_entry(&["has-slot", "boot_a"], "yes"),
+            custom_var_entry(&["has-slot", "raw_0"], "yes"),
+            custom_var_entry(&["slot-count"], "dont-care"),
+            custom_var_entry(&["current-slot"], "dont-care"),
+            custom_var_entry(&["version-gbl"], "dont-care"),
+            custom_var_entry(&["unlocked"], "yes"),
+        ];
+        let tasks = vec![].into();
+        let parts = gbl_ops.disks();
+        let mut gbl_fb = GblFastboot::new(
+            &mut gbl_ops,
+            parts,
+            Task::run,
+            &tasks,
+            &dl_buffers,
+            GblFbData { boot_buffer: load_buffer.as_mut().into(), ..Default::default() },
+        );
+
+        for slot_count_case in [Err(Error::Unsupported), Err(Error::NotFound), Ok(0)] {
+            gbl_fb.gbl_ops.slot_count = Some(slot_count_case);
+            gbl_fb.gbl_ops.current_slot = Some(Err(Error::Unsupported));
+
+            // Virtual partition still falls back to platform `fastboot_variable` across all
+            // no-slotting representations (`Err(Unsupported)`, `Err(NotFound)`, and `Ok(0)`).
+            check_var(&mut gbl_fb, "partition-size", "bootloader", "0x1000000");
+            check_var(&mut gbl_fb, "partition-size", "raw_0", "0x1000");
+            // Without slotting every `has-slot` is `no` (never the vendor's `yes`).
+            check_var(&mut gbl_fb, "has-slot", "bootloader", "no");
+            check_var(&mut gbl_fb, "has-slot", "boot_a", "no");
+            check_var(&mut gbl_fb, "has-slot", "raw_0", "no");
+            check_var(&mut gbl_fb, "has-slot", "boot", "no");
+            check_var_failure(&mut gbl_fb, "has-slot", "");
+            // Without slotting neither `boot` nor `boot_ab` resolves to a GBL partition, so the
+            // vendor may answer for them (it has no entries here).
+            check_var_failure(&mut gbl_fb, "partition-size", "boot");
+            check_var_failure(&mut gbl_fb, "partition-size", "boot_ab");
+
+            let mut logger = TestVarSender(vec![]);
+            block_on(gbl_fb.get_var_all(&mut logger)).unwrap();
+            assert!(logger.0.iter().any(|v| v == "partition-size:bootloader: 0x1000000"));
+            for forbidden in [
+                "has-slot:bootloader: yes",
+                "has-slot:boot_a: yes",
+                "has-slot:raw_0: yes",
+                "slot-count: dont-care",
+                "current-slot: dont-care",
+                "version-gbl: dont-care",
+                "unlocked: yes",
+            ] {
+                assert!(
+                    !logger.0.iter().any(|v| v == forbidden),
+                    "case {slot_count_case:?} leaked {forbidden}"
+                );
+            }
+        }
+
+        // Genuine slot-info errors when slotting IS enabled (`slot_count = Ok(2)`) must propagate
+        // as an error rather than silently falling back to platform `custom_fastboot_vars`.
+        gbl_fb.gbl_ops.slot_count = Some(Ok(2));
+        gbl_fb.gbl_ops.slot_infos[0] = Err(Error::NotFound);
+        check_var_failure(&mut gbl_fb, "has-slot", "bootloader");
+    }
+
+    #[test]
+    fn test_fastboot_getvar_has_slot_non_slot_suffix() {
+        let dl_buffers = Shared::from(vec![Some(vec![0u8; KiB!(128)]); 1]);
+        let mut load_buffer = AlignedBuffer::new(MiB!(8), KERNEL_ALIGNMENT);
+        let mut storage = FakeGblOpsStorage::default();
+        storage.add_gpt_device(include_bytes!("../../../libstorage/test/gpt_test_1.bin"));
+        storage.add_raw_device(c"protect_f", [0xaau8; KiB!(4)]);
+        storage.add_raw_device(c"protect_s", [0x55u8; KiB!(4)]);
+        // Present only in the non-default slot.
+        storage.add_raw_device(c"only_b", [0x33u8; KiB!(4)]);
+        let mut gbl_ops = FakeGblOps::new(&storage);
+        // Conflicting platform override must be ignored/filtered because GBL natively owns
+        // `protect_f` as an unslotted partition (`_f` is not in device slots `['a', 'b']`).
+        gbl_ops.custom_fastboot_vars = vec![custom_var_entry(&["has-slot", "protect_f"], "yes")];
+        let tasks = vec![].into();
+        let parts = gbl_ops.disks();
+        let mut gbl_fb = GblFastboot::new(
+            &mut gbl_ops,
+            parts,
+            Task::run,
+            &tasks,
+            &dl_buffers,
+            GblFbData { boot_buffer: load_buffer.as_mut().into(), ..Default::default() },
+        );
+
+        check_var(&mut gbl_fb, "has-slot", "protect_f", "no");
+        check_var(&mut gbl_fb, "has-slot", "protect_s", "no");
+        check_var_failure(&mut gbl_fb, "has-slot", "protect");
+        // Any device slot suffix (not just the default slot) marks a partition as slotted.
+        check_var(&mut gbl_fb, "has-slot", "only", "yes");
+        assert_eq!(
+            gbl_fb.state.resolve_slotted_partitions(
+                gbl_fb.gbl_ops,
+                Some("only"),
+                None,
+                ResolveMode::CurrentSlot
+            ),
+            Err(Error::PartitionSlotMissing('a'))
+        );
+
+        let mut logger = TestVarSender(vec![]);
+        block_on(gbl_fb.get_var_all(&mut logger)).unwrap();
+        assert!(logger.0.iter().any(|v| v == "has-slot:protect_f: no"));
+        assert!(logger.0.iter().any(|v| v == "has-slot:protect_s: no"));
+        assert!(logger.0.iter().any(|v| v == "has-slot:only: yes"));
+        assert!(!logger.0.iter().any(|v| v == "has-slot:protect_f: yes"));
+        assert!(!logger.0.iter().any(|v| v.starts_with("has-slot:protect:")));
     }
 
     /// Builds an unsigned vbmeta image containing the given `(key, value)` property descriptors
@@ -3658,7 +4332,7 @@ pub(crate) mod test {
     }
 
     const FAIL_MESSAGE_CRITICAL_LOCK: &[u8] = b"FAILDevice is critical-locked";
-    const FAIL_MESSAGE_NOT_FOUND: &[u8] = b"FAILNotFound";
+    const FAIL_MESSAGE_NOT_FOUND: &[u8] = b"FAILPartitionNotFound";
 
     /// Attempts to flash 4KiB of 0xAA to `part` and returns the response.
     fn fb_flash(
@@ -3740,24 +4414,33 @@ pub(crate) mod test {
         let dl_buffers = Shared::from(vec![Some(vec![0u8; KiB!(128)]); 1]);
         let mut storage = FakeGblOpsStorage::default();
         storage.add_raw_device(c"critical", INITIAL_CONTENTS);
+        storage.add_raw_device(c"protect_f", INITIAL_CONTENTS);
         let mut gbl_ops = FakeGblOps::new(&storage);
         gbl_ops.avb_device_status.is_unlocked = true;
         gbl_ops.avb_device_status.is_unlockable = true;
         gbl_ops.current_slot = Some(Ok(1));
-        // Mark the "critical" partition as critically-locked.
-        gbl_ops.avb_partition_attributes = Some(Ok(vec![SpecializedPartition {
-            name: PartitionName::try_from("critical").unwrap(),
-            critical: Critical::Yes,
-            ..Default::default()
-        }]));
+        // Mark the "critical" and non-slot-suffixed "protect_f" partitions as critically-locked.
+        gbl_ops.avb_partition_attributes = Some(Ok(vec![
+            SpecializedPartition {
+                name: PartitionName::try_from("critical").unwrap(),
+                critical: Critical::Yes,
+                ..Default::default()
+            },
+            SpecializedPartition {
+                name: PartitionName::try_from("protect_f").unwrap(),
+                critical: Critical::Yes,
+                ..Default::default()
+            },
+        ]));
         let tasks = vec![].into();
         let parts = gbl_ops.disks();
         let boot_buffer = Default::default();
         let mut gbl_fb =
             GblFastboot::new(&mut gbl_ops, parts, Task::run, &tasks, &dl_buffers, boot_buffer);
 
-        // The exact name should be guarded by the critical lock.
+        // The exact names should be guarded by the critical lock.
         assert_eq!(fb_flash(&mut gbl_fb, "critical"), FAIL_MESSAGE_CRITICAL_LOCK);
+        assert_eq!(fb_flash(&mut gbl_fb, "protect_f"), FAIL_MESSAGE_CRITICAL_LOCK);
 
         // Slotted variations do not exist.
         assert_eq!(fb_flash(&mut gbl_fb, "critical_a"), FAIL_MESSAGE_NOT_FOUND);
@@ -3769,11 +4452,99 @@ pub(crate) mod test {
             fetch(&mut gbl_fb, "critical".into(), 0, INITIAL_CONTENTS.len()).unwrap(),
             INITIAL_CONTENTS
         );
+        assert_eq!(
+            fetch(&mut gbl_fb, "protect_f".into(), 0, INITIAL_CONTENTS.len()).unwrap(),
+            INITIAL_CONTENTS
+        );
 
         // Unlock the critical lock, then flashing should work.
         assert_eq!(fb_unlock_critical(&mut gbl_fb), b"OKAY");
 
         check_flash_part(&mut gbl_fb, "critical", &[0x55u8; KiB!(4)]);
+        check_flash_part(&mut gbl_fb, "protect_f", &[0x55u8; KiB!(4)]);
+    }
+
+    /// Builds critically-locked fake ops with attributes `critical` and `protect_f` marked
+    /// `Critical::Yes`.
+    fn critical_lock_test_ops(storage: &FakeGblOpsStorage) -> FakeGblOps<'_> {
+        let mut gbl_ops = FakeGblOps::new(storage);
+        gbl_ops.avb_device_status.is_unlocked = true;
+        gbl_ops.avb_device_status.is_unlockable = true;
+        gbl_ops.avb_partition_attributes = Some(Ok(vec![
+            SpecializedPartition {
+                name: PartitionName::try_from("critical").unwrap(),
+                critical: Critical::Yes,
+                ..Default::default()
+            },
+            SpecializedPartition {
+                name: PartitionName::try_from("protect_f").unwrap(),
+                critical: Critical::Yes,
+                ..Default::default()
+            },
+        ]));
+        gbl_ops
+    }
+
+    #[test]
+    fn test_flash_partition_critical_slot_query_error() {
+        // A slot query error must never bypass the critical lock (neither for a slotted partition
+        // whose attribute uses the base name, nor for an unslotted `_[a-z]` partition whose
+        // attribute uses the full name), while explicit slotted names stay flashable.
+        for (slot_count, slot_infos) in [
+            (Some(Ok(2)), vec![Ok(slot('a')), Err(Error::Other(None))]),
+            (Some(Err(Error::UnsupportedVersion)), vec![Ok(slot('a')), Ok(slot('b'))]),
+        ] {
+            let dl_buffers = Shared::from(vec![Some(vec![0u8; KiB!(128)]); 1]);
+            let mut storage = FakeGblOpsStorage::default();
+            for name in [c"critical_a", c"critical_b", c"protect_f", c"boot_a", c"boot_b"] {
+                storage.add_raw_device(name, [0x11u8; KiB!(4)]);
+            }
+            let mut gbl_ops = critical_lock_test_ops(&storage);
+            gbl_ops.slot_count = slot_count;
+            gbl_ops.slot_infos = slot_infos;
+            let tasks = vec![].into();
+            let parts = gbl_ops.disks();
+            let mut gbl_fb = GblFastboot::new(
+                &mut gbl_ops,
+                parts,
+                Task::run,
+                &tasks,
+                &dl_buffers,
+                Default::default(),
+            );
+
+            assert_eq!(fb_flash(&mut gbl_fb, "critical_a"), FAIL_MESSAGE_CRITICAL_LOCK);
+            assert_eq!(fb_flash(&mut gbl_fb, "protect_f"), FAIL_MESSAGE_CRITICAL_LOCK);
+            check_flash_part(&mut gbl_fb, "boot_a", &[0x55u8; KiB!(4)]);
+        }
+    }
+
+    #[test]
+    fn test_flash_partition_critical_without_slotting() {
+        // Without slotting, attributes are matched by the full partition name only.
+        let dl_buffers = Shared::from(vec![Some(vec![0u8; KiB!(128)]); 1]);
+        let mut storage = FakeGblOpsStorage::default();
+        for name in [c"critical_a", c"critical_b", c"protect_f"] {
+            storage.add_raw_device(name, [0x11u8; KiB!(4)]);
+        }
+        let mut gbl_ops = critical_lock_test_ops(&storage);
+        gbl_ops.slot_count = Some(Err(Error::Unsupported));
+        gbl_ops.current_slot = Some(Err(Error::Unsupported));
+        let tasks = vec![].into();
+        let parts = gbl_ops.disks();
+        let mut gbl_fb = GblFastboot::new(
+            &mut gbl_ops,
+            parts,
+            Task::run,
+            &tasks,
+            &dl_buffers,
+            Default::default(),
+        );
+
+        assert_eq!(fb_flash(&mut gbl_fb, "protect_f"), FAIL_MESSAGE_CRITICAL_LOCK);
+        // `critical` (attribute name) is not a partition, and `critical_a` is not matched by it.
+        assert_eq!(fb_flash(&mut gbl_fb, "critical"), FAIL_MESSAGE_NOT_FOUND);
+        check_flash_part(&mut gbl_fb, "critical_a", &[0x55u8; KiB!(4)]);
     }
 
     // We only allow raw disk writes in dev builds.
@@ -4331,7 +5102,7 @@ pub(crate) mod test {
         check_upload(&mut gbl_fb, "/1", off, size, Ok(&disk_dup[..]));
 
         // Fetching without storage ID should use default ID and thus the following should fail.
-        check_upload(&mut gbl_fb, "boot_a/", off, size, Err(Error::NotFound.into()));
+        check_upload(&mut gbl_fb, "boot_a/", off, size, Err(Error::PartitionNotFound.into()));
 
         // Sets default block to #1 (unmodified `disk_dup`)
         block_on(oem(&mut gbl_fb, "gbl-set-default-block 1", &resp)).unwrap();
@@ -4919,7 +5690,7 @@ pub(crate) mod test {
         let mut gbl_fb =
             GblFastboot::new(&mut gbl_ops, parts, Task::run, &tasks, &dl_buffers, boot_buffer);
 
-        gbl_fb.stage_data_type = Some(StageDataType::Trace);
+        gbl_fb.state.stage_data_type = Some(StageDataType::Trace);
 
         let mut upload_out = [0u8; 100];
         let test_uploader = TestUploadBuilder(&mut upload_out[..]);
@@ -7852,7 +8623,10 @@ pub(crate) mod test {
 
         set_download(&mut gbl_fb, img);
         let bad_partition_cmd = "stream-flash:boot_d:0:0xb47c63c1".try_into().unwrap();
-        assert_eq!(block_on(gbl_fb.stream(bad_partition_cmd, &resp)), Err(Error::NotFound.into()));
+        assert_eq!(
+            block_on(gbl_fb.stream(bad_partition_cmd, &resp)),
+            Err(Error::PartitionNotFound.into())
+        );
     }
 
     fn gbl_stream_fill_test_helper(fill_size: usize, offset: usize) {
@@ -7920,7 +8694,7 @@ pub(crate) mod test {
     fn test_gbl_stream_fill_bad_partition() {
         gbl_stream_fill_error_test_helper(
             "stream-fill:boot_d:0:1000:0xF005500F".try_into().unwrap(),
-            Error::NotFound.into(),
+            Error::PartitionNotFound.into(),
         );
     }
 
@@ -8137,7 +8911,7 @@ pub(crate) mod test {
                 "unexpected snapshot-update-status in getvar all: {:?}",
                 logger.0
             );
-            let expected_err = if has_small_misc { "OutOfRange" } else { "NotFound" };
+            let expected_err = if has_small_misc { "OutOfRange" } else { "PartitionNotFound" };
             assert!(
                 gbl_ops
                     .console_logs
@@ -8280,7 +9054,7 @@ pub(crate) mod test {
     #[test]
     fn test_snapshot_update_unavailable_misc() {
         for (misc_size, expected_err) in [
-            (None, &b"FAILNotFound"[..]),
+            (None, &b"FAILPartitionNotFound"[..]),
             (Some(KiB!(4)), &b"FAILOutOfRange"[..]),
             (Some(KiB!(64)), &b"FAILInvalidInput"[..]),
         ] {
@@ -8845,9 +9619,11 @@ pub(crate) mod test {
 
     #[test]
     fn test_snapshot_update_guards_allow_unavailable_or_uninitialized_misc() {
-        for (misc_size, expected_err) in
-            [(None, "NotFound"), (Some(KiB!(4)), "OutOfRange"), (Some(KiB!(64)), "InvalidInput")]
-        {
+        for (misc_size, expected_err) in [
+            (None, "PartitionNotFound"),
+            (Some(KiB!(4)), "OutOfRange"),
+            (Some(KiB!(64)), "InvalidInput"),
+        ] {
             let mut storage = FakeGblOpsStorage::default();
             if let Some(sz) = misc_size {
                 storage.add_raw_device(c"misc", vec![0u8; sz]);
@@ -8981,7 +9757,7 @@ pub(crate) mod test {
                 Default::default(),
             );
             let resp: TestResponder = Default::default();
-            gbl_fb.enable_async_task = true;
+            gbl_fb.state.enable_async_task = true;
 
             block_on(gbl_fb.erase("boot_a", &resp)).unwrap();
             block_on(gbl_fb.erase("boot_b", &resp)).unwrap();
@@ -9007,7 +9783,7 @@ pub(crate) mod test {
                 &resp,
             ))
             .unwrap();
-            block_on(gbl_fb.oem_sync_tasks(&mut (&resp))).unwrap();
+            block_on(gbl_fb.state.oem_sync_tasks(gbl_fb.gbl_ops, &mut (&resp))).unwrap();
             check_var(&mut gbl_fb, "snapshot-update-status", "", "none");
 
             // Async `flash:misc` with `Snapshotted` drains before subsequent `super` stream chunk.
@@ -9029,7 +9805,7 @@ pub(crate) mod test {
                 &resp,
             ))
             .unwrap();
-            block_on(gbl_fb.oem_sync_tasks(&mut (&resp))).unwrap();
+            block_on(gbl_fb.state.oem_sync_tasks(gbl_fb.gbl_ops, &mut (&resp))).unwrap();
             check_var(&mut gbl_fb, "snapshot-update-status", "", "none");
         }
 

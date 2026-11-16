@@ -15,11 +15,11 @@
 use super::{CommandResult, GblFastbootError};
 use crate::{
     android_boot::hasher::{Hasher, Sha256},
-    fastboot::{BufferPool, GblFastboot, PinFutContainerTyped, ResolveMode},
+    fastboot::{BufferPool, GblFastbootState, PinFutContainerTyped, ResolveMode},
     gbl_avb::ops::GblAvbOps,
     gbl_println,
     partition::{check_part_unique, split_partition_suffix, Partition, RawName},
-    slots::{Bootability, Slot},
+    slots::{Bootability, Slot, Suffix},
     GblOps,
 };
 use avb::{slot_verify, HashtreeErrorMode, SlotVerifyError, SlotVerifyFlags, VbmetaVerifyError};
@@ -82,30 +82,6 @@ const UNLOCKED_CRITICAL: &str = "unlocked-critical";
 const STREAM_SEGMENT_SIZE: &str = "stream-segment-size";
 
 const SNAPSHOT_UPDATE_STATUS: &str = "snapshot-update-status";
-
-pub(crate) const GETVAR_ALL_FILTER: &[&str] = &[
-    IS_USERSPACE,
-    VERSION_GBL,
-    SLOT_COUNT,
-    CURRENT_SLOT,
-    SLOT_SUCCESSFUL,
-    SLOT_UNBOOTABLE,
-    SLOT_RETRY_COUNT,
-    HAS_SLOT,
-    FINGERPRINT,
-    PARTITION_START,
-    MAX_FETCH_SIZE,
-    PARTITION_SIZE,
-    PARTITION_TYPE,
-    PARTITION_GUID,
-    BLOCK_DEVICE,
-    DEFAULT_BLOCK,
-    MAX_DOWNLOAD_SIZE,
-    UNLOCKED,
-    UNLOCKED_CRITICAL,
-    STREAM_SEGMENT_SIZE,
-    SNAPSHOT_UPDATE_STATUS,
-];
 
 #[derive(FromBytes, IntoBytes, Unaligned)]
 #[repr(C, packed)]
@@ -219,10 +195,64 @@ fn format_unlocked(
     yes_no_str(unlocked)
 }
 
-// See definition of [GblFastboot] for docs on lifetimes and generics parameters.
-impl<'a: 'c, 'b: 'c, 'c, 'd, G, B, P2, T, P, C, F> GblFastboot<'a, 'b, 'c, 'd, G, B, P2, T, P, C, F>
+/// Iterates all slots in the order of slot index.
+pub(crate) fn slots_iter<'a>(
+    gbl_ops: &mut impl GblOps<'a>,
+) -> Result<impl Iterator<Item = Result<Slot, Error>> + '_, Error> {
+    Ok((0..gbl_ops.get_slot_count()?).map(|idx| gbl_ops.get_slot_info(idx)))
+}
+
+/// Returns the device slot count, or `Ok(None)` when device slotting is not supported
+/// (`get_slot_count()` returns `Ok(0)`, `Err(Error::Unsupported)`, or `Err(Error::NotFound)`).
+pub(crate) fn slot_count_if_supported<'a>(
+    gbl_ops: &mut impl GblOps<'a>,
+) -> Result<Option<u8>, Error> {
+    match gbl_ops.get_slot_count() {
+        Ok(0) | Err(Error::Unsupported | Error::NotFound) => Ok(None),
+        Ok(count) => Ok(Some(count)),
+        Err(e) => Err(e),
+    }
+}
+
+/// Set of slot suffixes (`'a'..='z'`) reported by [`GblOps`], as a bit mask.
+#[derive(Copy, Clone, Default)]
+pub(crate) struct SlotSuffixMask(u32);
+
+impl SlotSuffixMask {
+    /// Returns the mask bit for `suffix`. [`Suffix`] guarantees `'a'..='z'`, so the shift is in
+    /// `0..26`.
+    fn bit(suffix: Suffix) -> u32 {
+        let c = suffix.as_char();
+        debug_assert!(c.is_ascii_lowercase(), "slot suffix {c:?} is not in 'a'..='z'");
+        1u32 << (u32::from(c) - u32::from('a'))
+    }
+
+    /// Collects the suffixes of all device slots from `gbl_ops`.
+    ///
+    /// Returns `Ok(None)` when device slotting is not supported (see
+    /// [`slot_count_if_supported`]) and propagates `get_slot_info()` errors.
+    pub(crate) fn new<'a>(gbl_ops: &mut impl GblOps<'a>) -> Result<Option<Self>, Error> {
+        let Some(count) = slot_count_if_supported(gbl_ops)? else {
+            return Ok(None);
+        };
+        let mut mask = 0u32;
+        for idx in 0..count {
+            mask |= Self::bit(gbl_ops.get_slot_info(idx)?.suffix);
+        }
+        Ok(Some(Self(mask)))
+    }
+
+    /// Splits `part` into `(base, suffix)` only if `suffix` is a slot suffix on this device.
+    pub(crate) fn split(self, part: &str) -> Option<(&str, char)> {
+        split_partition_suffix(part).filter(|(_, suffix)| {
+            Suffix::from_char(*suffix).is_ok_and(|suffix| self.0 & Self::bit(suffix) != 0)
+        })
+    }
+}
+
+// See definition of [GblFastbootState] for docs on lifetimes and generics parameters.
+impl<'a: 'c, 'b: 'c, 'c, 'd, B, P2, T, P, C, F> GblFastbootState<'a, 'b, 'c, 'd, B, P2, T, P, C, F>
 where
-    G: GblOps<'a>,
     B: BlockIo,
     P2: BufferPool,
     T: DerefMut<Target = [u8]>,
@@ -262,6 +292,7 @@ where
     /// Entry point for "fastboot getvar <variable>..."
     pub(crate) async fn get_var_internal<'s, 't>(
         &mut self,
+        gbl_ops: &mut impl GblOps<'a>,
         name: &CStr,
         args: impl Iterator<Item = &'t CStr> + Clone,
         out: &'s mut [u8],
@@ -271,39 +302,86 @@ where
         args_str.clone().find(|v| v.is_err()).unwrap_or(Ok(""))?;
         let args_str = args_str.map(|v| v.unwrap());
         let name_str = name.to_str()?;
-        Ok(match name_str {
+        let sz = match self.get_var_native(gbl_ops, name_str, args_str, None, false, out).await? {
+            Some(sz) => sz,
+            None => gbl_ops.fastboot_variable(name, args, out)?,
+        };
+        Ok(from_utf8(out.get(..sz).ok_or("Invalid variable value size")?)?)
+    }
+
+    /// Looks up a Fastboot variable managed natively by GBL and writes its value into `out`.
+    ///
+    /// When `probe_only` is `true` (used to filter vendor entries in `getvar all`), reserved
+    /// variables that are expensive to compute (disk, secure-world, or vendor callback I/O) only
+    /// report whether GBL manages them instead of their formatted value, and `dynamic_parts`
+    /// avoids re-reading `super`. Cheap variables always return their actual value.
+    ///
+    /// Returns `Ok(Some(len))` if GBL manages the variable, `Ok(None)` if the variable is not
+    /// managed by GBL or the target partition is not found on GBL's disks, or `Err(e)` if GBL
+    /// reserves it and the query fails for any other reason.
+    async fn get_var_native<'t>(
+        &mut self,
+        gbl_ops: &mut impl GblOps<'a>,
+        name_str: &str,
+        args_str: impl Iterator<Item = &'t str> + Clone,
+        dynamic_parts: Option<&[RawName]>,
+        probe_only: bool,
+        out: &mut [u8],
+    ) -> CommandResult<Option<usize>> {
+        let val = match name_str {
             MAX_DOWNLOAD_SIZE | IS_USERSPACE | VERSION_GBL | MAX_FETCH_SIZE | DEFAULT_BLOCK
             | STREAM_SEGMENT_SIZE => {
-                self.get_builtin_var(name_str, out).await?.ok_or(Error::InvalidInput)?
+                Some(self.get_builtin_var(name_str, out).await?.ok_or(Error::InvalidInput)?)
             }
-            SLOT_COUNT => format_slot_count(self.gbl_ops.get_slot_count()?, out),
-            CURRENT_SLOT => format_current_slot(self.gbl_ops.get_current_slot()?, out),
-            SLOT_SUCCESSFUL => {
-                snprintf!(out, "{}", self.get_fastboot_slot_info(args_str)?.successful)
-            }
-            SLOT_UNBOOTABLE => {
-                snprintf!(out, "{}", self.get_fastboot_slot_info(args_str)?.unbootable)
-            }
-            SLOT_RETRY_COUNT => {
-                snprintf!(out, "{}", self.get_fastboot_slot_info(args_str)?.retry_count)
-            }
-            HAS_SLOT => self.get_var_has_slot(args_str, out).await?,
-            FINGERPRINT => self.get_var_fingerprint(args_str, out).await?,
+            SLOT_COUNT => Some(format_slot_count(gbl_ops.get_slot_count()?, out)),
+            CURRENT_SLOT => Some(format_current_slot(gbl_ops.get_current_slot()?, out)),
+            SLOT_SUCCESSFUL => Some(snprintf!(
+                out,
+                "{}",
+                self.get_fastboot_slot_info(gbl_ops, args_str)?.successful
+            )),
+            SLOT_UNBOOTABLE => Some(snprintf!(
+                out,
+                "{}",
+                self.get_fastboot_slot_info(gbl_ops, args_str)?.unbootable
+            )),
+            SLOT_RETRY_COUNT => Some(snprintf!(
+                out,
+                "{}",
+                self.get_fastboot_slot_info(gbl_ops, args_str)?.retry_count
+            )),
+            HAS_SLOT => self.get_var_has_slot(gbl_ops, args_str, dynamic_parts, out).await?,
+            // Reads `vbmeta`.
+            FINGERPRINT => Some(match probe_only {
+                true => "",
+                false => self.get_var_fingerprint(gbl_ops, args_str, out).await?,
+            }),
+            // Note: Currently `partition-*` only covers GPT and raw block partitions in
+            // `self.disks` (not dynamic partitions inside `super`). If `partition-*` is extended
+            // to cover `super` dynamic partitions in the future, we may need to check `super`
+            // here too.
             PARTITION_START => self.get_var_partition_start(args_str, out)?,
-            PARTITION_SIZE => self.get_var_partition_size(args_str, out)?,
-            PARTITION_TYPE => self.get_var_partition_type(args_str, out)?,
+            PARTITION_SIZE => self.get_var_partition_size(gbl_ops, args_str, out)?,
+            PARTITION_TYPE => self.get_var_partition_type(gbl_ops, args_str, probe_only, out)?,
             PARTITION_GUID => self.get_var_partition_guid(args_str, out)?,
-            BLOCK_DEVICE => self.get_var_block_device(args_str, out)?,
-            UNLOCKED => self.get_var_unlocked(fastboot::LockType::Device, out)?,
-            UNLOCKED_CRITICAL => self.get_var_unlocked(fastboot::LockType::Critical, out)?,
-            SNAPSHOT_UPDATE_STATUS => {
-                snprintf!(out, "{}", self.snapshot_merge_status().await?)
-            }
-            _ => {
-                let sz = self.gbl_ops.fastboot_variable(name, args, out)?;
-                from_utf8(out.get(..sz).ok_or("Invalid variable value size")?)?
-            }
-        })
+            BLOCK_DEVICE => Some(self.get_var_block_device(args_str, out)?),
+            // Queries the secure world via AVB.
+            UNLOCKED => Some(match probe_only {
+                true => "",
+                false => self.get_var_unlocked(gbl_ops, fastboot::LockType::Device, out)?,
+            }),
+            UNLOCKED_CRITICAL => Some(match probe_only {
+                true => "",
+                false => self.get_var_unlocked(gbl_ops, fastboot::LockType::Critical, out)?,
+            }),
+            // Waits for pending `misc` tasks and reads `misc`.
+            SNAPSHOT_UPDATE_STATUS => Some(match probe_only {
+                true => "",
+                false => snprintf!(out, "{}", self.snapshot_merge_status(gbl_ops).await?),
+            }),
+            _ => None,
+        };
+        Ok(val.map(str::len))
     }
 
     /// Entry point for "fastboot getvar all..."
@@ -311,29 +389,31 @@ where
     /// TODO(b/465769208): Reuse code between `getvar` and `getvar all`.
     pub(crate) async fn get_var_all_internal(
         &mut self,
+        gbl_ops: &mut impl GblOps<'a>,
         send: &mut impl VarInfoSender,
     ) -> CommandResult<()> {
         let mut buf = [0u8; GETVAR_RESPONSE_MAX_SIZE];
         self.send_builtin_var(MAX_DOWNLOAD_SIZE, &mut buf, send).await?;
         self.send_builtin_var(IS_USERSPACE, &mut buf, send).await?;
         self.send_builtin_var(VERSION_GBL, &mut buf, send).await?;
-        match self.gbl_ops.get_slot_count() {
+        let dynamic_parts = self.get_dynamic_partition_names(gbl_ops).await.unwrap_or_default();
+        match gbl_ops.get_slot_count() {
             Ok(slot_count) => {
                 send.send_var_info(SLOT_COUNT, [], format_slot_count(slot_count, &mut buf)).await?;
 
                 // Variable may be optional. Continues instead of erroring out.
-                match self.gbl_ops.get_current_slot() {
+                match gbl_ops.get_current_slot() {
                     Ok(slot) => {
                         send.send_var_info(CURRENT_SLOT, [], format_current_slot(slot, &mut buf))
                             .await?
                     }
-                    Err(e) => gbl_println!(self.gbl_ops, "Failed to get current_slot {e}"),
+                    Err(e) => gbl_println!(gbl_ops, "Failed to get current_slot {e}"),
                 };
 
                 for idx in 0..slot_count {
                     // Variable may be optional. Continues instead of erroring out.
-                    let Ok(slot) = self.gbl_ops.get_slot_info(idx).inspect_err(|e| {
-                        gbl_println!(self.gbl_ops, "Failed to get slot_info for slot {idx}, {e}");
+                    let Ok(slot) = gbl_ops.get_slot_info(idx).inspect_err(|e| {
+                        gbl_println!(gbl_ops, "Failed to get slot_info for slot {idx}, {e}");
                     }) else {
                         continue;
                     };
@@ -344,7 +424,7 @@ where
                     send.send_var_info(SLOT_UNBOOTABLE, [suffix], unbootable).await?;
                     send.send_var_info(SLOT_RETRY_COUNT, [suffix], snprintf!(buf, "{retry_count}"))
                         .await?;
-                    match self.get_system_fingerprint_for_slot(suffix, &mut buf).await {
+                    match self.get_system_fingerprint_for_slot(gbl_ops, suffix, &mut buf).await {
                         Ok(fp) => {
                             let mut part_buf = [0u8; 16];
                             send.send_var_info(
@@ -356,15 +436,15 @@ where
                         }
                         Err(Error::NotFound) => {}
                         Err(e) => gbl_println!(
-                            self.gbl_ops,
+                            gbl_ops,
                             "Failed to get fingerprint for slot {suffix}: {e:?}"
                         ),
                     }
                 }
-                self.get_all_partition_has_slot(send).await?;
+                self.get_all_partition_has_slot(gbl_ops, &dynamic_parts, send).await?;
             }
             Err(e) => gbl_println!(
-                self.gbl_ops,
+                gbl_ops,
                 "Slotting is not supported, failed to get {SLOT_COUNT}: {e}. Slot-related \
                 fastboot variables cannot be provided."
             ),
@@ -372,11 +452,11 @@ where
         self.send_builtin_var(MAX_FETCH_SIZE, &mut buf, send).await?;
         self.get_all_block_device(send).await?;
         self.send_builtin_var(DEFAULT_BLOCK, &mut buf, send).await?;
-        self.get_all_partition_vars(send).await?;
+        self.get_all_partition_vars(gbl_ops, send).await?;
 
         self.send_builtin_var(STREAM_SEGMENT_SIZE, &mut buf, send).await?;
 
-        match self.gbl_ops.avb_read_device_status() {
+        match gbl_ops.avb_read_device_status() {
             Ok(device_status) => {
                 send.send_var_info(
                     UNLOCKED,
@@ -391,34 +471,49 @@ where
                 )
                 .await?;
             }
-            Err(e) => gbl_println!(self.gbl_ops, "failed to read lock state: {e}"),
+            Err(e) => gbl_println!(gbl_ops, "failed to read lock state: {e}"),
         };
 
-        match self.snapshot_merge_status().await {
+        match self.snapshot_merge_status(gbl_ops).await {
             Ok(status) => {
                 send.send_var_info(SNAPSHOT_UPDATE_STATUS, [], status.into()).await?;
             }
             Err(GblFastbootError::Libgbl(Error::Unsupported)) => {}
-            Err(e) => gbl_println!(self.gbl_ops, "snapshot-update-status unavailable: {e}"),
+            Err(e) => gbl_println!(gbl_ops, "snapshot-update-status unavailable: {e}"),
         }
 
         // Gets platform specific variables
-        let tasks = self.tasks();
-        let _ = self.gbl_ops.fastboot_visit_all_variables(|ops, args, val| {
-            if let Some((name, args)) = args.split_first_chunk::<1>() {
-                let name = name[0].to_str().unwrap_or("?");
-                // Needs to split because the interface allows backend to pass ':' concatenated
+        let tasks = self.tasks;
+        let _ = gbl_ops.fastboot_visit_all_variables(|ops, args, val| {
+            if let Some((first, rest_args)) = args.split_first_chunk::<1>() {
+                // Needs to split ':' because the interface allows backend to pass ':' concatenated
                 // string as a whole.
-                let var = name.split(':').next().unwrap_or(name);
-                if GETVAR_ALL_FILTER.iter().find(|v| **v == var).is_some() {
-                    // Its possible that backend might have its own special non-gpt/raw block
-                    // partitions (i.e. virtual) and therefore needs to expose
-                    // `partition-size/partition-type` vars for them. If this will be the case,
-                    // allow `partition-size/partition-type` when partition doesn't exist.
-                    gbl_println!(ops, "Variable {var:?} is reserved by GBL.");
-                    return;
+                let mut split_args =
+                    args.iter().map(|s| s.to_str().unwrap_or("?")).flat_map(|s| s.split(':'));
+                let var = split_args.next().unwrap_or("?");
+                let res = block_on(select(
+                    self.get_var_native(ops, var, split_args, Some(&dynamic_parts), true, &mut buf),
+                    async {
+                        loop {
+                            tasks.borrow_mut().poll_all();
+                            yield_now().await;
+                        }
+                    },
+                ))
+                .0;
+                match res {
+                    Some(Ok(None)) => {}
+                    Some(Err(e)) => {
+                        gbl_println!(ops, "Variable {var:?} is reserved by GBL (error: {e}).");
+                        return;
+                    }
+                    _ => {
+                        gbl_println!(ops, "Variable {var:?} is reserved by GBL.");
+                        return;
+                    }
                 }
-                let args = args.iter().map(|v| v.to_str().unwrap_or("?"));
+                let name = first[0].to_str().unwrap_or("?");
+                let args = rest_args.iter().map(|v| v.to_str().unwrap_or("?"));
                 let val = val.to_str().unwrap_or("?");
                 // Manually polls async tasks so that we can still get parallelism while
                 // running in the context of backend.
@@ -442,10 +537,15 @@ where
     }
 
     /// Parses and finds the size of the given partition.
-    pub(crate) fn partition_size(&mut self, part: &str) -> CommandResult<u64> {
+    pub(crate) fn partition_size(
+        &self,
+        gbl_ops: &mut impl GblOps<'a>,
+        part: &str,
+    ) -> CommandResult<u64> {
         let (part, blk_id, off, sz) = self.parse_partition_arg(part)?;
         // If the user just gives the partition base name, resolve to the current slot.
-        let (_, parts) = self.resolve_slotted_partitions(part, blk_id, ResolveMode::CurrentSlot)?;
+        let (_, parts) =
+            self.resolve_slotted_partitions(gbl_ops, part, blk_id, ResolveMode::CurrentSlot)?;
         // Slotted partition-size only make sense if they are all the same. Because it may be used
         // to copy AVB footer.
         for (_, p) in &parts[1..] {
@@ -460,43 +560,61 @@ where
 
     /// "fastboot getvar partition-size"
     fn get_var_partition_size<'s, 't>(
-        &mut self,
+        &self,
+        gbl_ops: &mut impl GblOps<'a>,
         mut args: impl Iterator<Item = &'t str> + Clone,
         out: &'s mut [u8],
-    ) -> CommandResult<&'s str> {
-        Ok(snprintf!(out, "{:#x}", self.partition_size(args.next().ok_or("Missing partition")?)?))
+    ) -> CommandResult<Option<&'s str>> {
+        let raw_part = next_arg(&mut args).ok_or("Missing partition")?;
+        match self.partition_size(gbl_ops, raw_part) {
+            Ok(sz) => Ok(Some(snprintf!(out, "{:#x}", sz))),
+            Err(GblFastbootError::Libgbl(Error::PartitionNotFound)) if !raw_part.contains('/') => {
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// "fastboot getvar partition-type"
     fn get_var_partition_type<'s, 't>(
-        &mut self,
+        &self,
+        gbl_ops: &mut impl GblOps<'a>,
         mut args: impl Iterator<Item = &'t str> + Clone,
+        probe_only: bool,
         out: &'s mut [u8],
-    ) -> CommandResult<&'s str> {
-        let part = args.next().ok_or("Missing partition")?;
-        let part = self.parse_partition_arg(part)?.0.ok_or("Missing partition")?;
-        match check_part_unique(self.disks, part) {
-            Ok(_) | Err(Error::NotUnique) => {
-                let part_type = self.gbl_ops.fastboot_get_partition_type(part)?;
-                Ok(snprintf!(out, "{part_type}"))
-            }
+    ) -> CommandResult<Option<&'s str>> {
+        let raw_part = next_arg(&mut args).ok_or("Missing partition")?;
+        let part = self.parse_partition_arg(raw_part)?.0.ok_or("Missing partition")?;
+        match self.find_partition(Some(part), None) {
+            Ok(_) | Err(Error::NotUnique) => match probe_only {
+                true => Ok(Some("")),
+                false => {
+                    let part_type = gbl_ops.fastboot_get_partition_type(part)?;
+                    Ok(Some(snprintf!(out, "{part_type}")))
+                }
+            },
+            Err(Error::PartitionNotFound) if !raw_part.contains('/') => Ok(None),
             Err(e) => Err(e.into()),
         }
     }
 
     /// "fastboot getvar partition-guid"
     fn get_var_partition_guid<'s, 't>(
-        &mut self,
+        &self,
         mut args: impl Iterator<Item = &'t str> + Clone,
         out: &'s mut [u8],
-    ) -> CommandResult<&'s str> {
-        let (part, blk_id, _, _) =
-            self.parse_partition_arg(args.next().ok_or("Missing partition")?)?;
-        let (_, ptn) = self.find_partition(part, blk_id)?;
+    ) -> CommandResult<Option<&'s str>> {
+        let raw_part = next_arg(&mut args).ok_or("Missing partition")?;
+        let (part, blk_id, _, _) = self.parse_partition_arg(raw_part)?;
+        let (_, ptn) = match self.find_partition(part, blk_id) {
+            Ok(v) => v,
+            Err(Error::PartitionNotFound) if !raw_part.contains('/') => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
 
         match ptn {
             Partition::Gpt(gpt_partition) => {
-                Ok(snprintf!(out, "{}", gpt_partition.gpt_entry().guid))
+                Ok(Some(snprintf!(out, "{}", gpt_partition.gpt_entry().guid)))
             }
             _ => Err("Not a GPT partition".into()),
         }
@@ -504,24 +622,25 @@ where
 
     /// "fastboot getvar partition-start"
     fn get_var_partition_start<'s, 't>(
-        &mut self,
+        &self,
         mut args: impl Iterator<Item = &'t str> + Clone,
         out: &'s mut [u8],
-    ) -> CommandResult<&'s str> {
-        let (_, ptn) = args
-            .next()
-            .ok_or(GblFastbootError::from("Missing partition"))
-            .and_then(|arg| self.parse_partition_arg(arg))
-            .and_then(|(part, blk_id, _, _)| {
-                self.find_partition(part, blk_id).map_err(GblFastbootError::from)
-            })?;
+    ) -> CommandResult<Option<&'s str>> {
+        let raw_part = next_arg(&mut args).ok_or("Missing partition")?;
+        let (part, blk_id, _, _) = self.parse_partition_arg(raw_part)?;
+        let (_, ptn) = match self.find_partition(part, blk_id) {
+            Ok(v) => v,
+            Err(Error::PartitionNotFound) if !raw_part.contains('/') => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
 
-        Ok(snprintf!(out, "{:#x}", ptn.absolute_range()?.0))
+        Ok(Some(snprintf!(out, "{:#x}", ptn.absolute_range()?.0)))
     }
 
     /// Gets all "partition-size/partition-type/partition-guid/partition-start"
     async fn get_all_partition_vars(
-        &mut self,
+        &self,
+        gbl_ops: &mut impl GblOps<'a>,
         responder: &mut impl VarInfoSender,
     ) -> CommandResult<()> {
         // Though any sub range of a GPT partition or raw block counts as a partition in GBL
@@ -534,7 +653,7 @@ where
                 let ptn = blk.get_partition_by_idx(ptn_idx)?;
                 let sz: u64 = ptn.size()?;
                 let part = ptn.name()?;
-                let part_type = self.gbl_ops.fastboot_get_partition_type(part)?;
+                let part_type = gbl_ops.fastboot_get_partition_type(part)?;
 
                 // Assumes max partition name length of 72 plus max u64 hex string length 18.
                 let mut part_id_buf = [0u8; 128];
@@ -591,12 +710,9 @@ where
     }
 
     /// Gets all "block-device" variables.
-    async fn get_all_block_device(
-        &mut self,
-        responder: &mut impl VarInfoSender,
-    ) -> CommandResult<()> {
+    async fn get_all_block_device(&self, responder: &mut impl VarInfoSender) -> CommandResult<()> {
         let mut val = [0u8; 32];
-        for (idx, blk) in self.gbl_ops.disks().iter().enumerate() {
+        for (idx, blk) in self.disks.iter().enumerate() {
             let mut id_str = [0u8; 32];
             let id = snprintf!(id_str, "{:x}", idx);
             let info = blk.block_info();
@@ -642,12 +758,12 @@ where
 
     /// "fastboot getvar unlocked" and "fastboot getvar unlocked-critical"
     fn get_var_unlocked<'s>(
-        &mut self,
+        &self,
+        gbl_ops: &mut impl GblOps<'a>,
         lock_type: fastboot::LockType,
         out: &'s mut [u8],
     ) -> CommandResult<&'s str> {
-        let status =
-            self.gbl_ops.avb_read_device_status().map_err(|_| "failed to read lock state")?;
+        let status = gbl_ops.avb_read_device_status().map_err(|_| "failed to read lock state")?;
         Ok(snprintf!(out, "{}", format_unlocked(&status, lock_type)))
     }
 
@@ -655,7 +771,8 @@ where
     /// "fastboot getvar slot-unbootable:<slot-suffix>"
     /// "fastboot getvar slot-retry-count:<slot-suffix>"
     fn get_fastboot_slot_info<'t>(
-        &mut self,
+        &self,
+        gbl_ops: &mut impl GblOps<'a>,
         mut args: impl Iterator<Item = &'t str> + Clone,
     ) -> CommandResult<FastbootSlotInfo> {
         let suffix_str = args.next().ok_or("Missing slot suffix")?;
@@ -663,8 +780,7 @@ where
             return Err("Slot suffix must be a single character".into());
         }
         let suffix = suffix_str.chars().next().ok_or("Invalid slot")?;
-        let slot = self
-            .slots_iter()?
+        let slot = slots_iter(gbl_ops)?
             .find(|slot| slot.is_ok() && slot.unwrap().suffix.as_char() == suffix)
             .ok_or("Invalid slot")??;
         Ok(slot.into())
@@ -672,18 +788,34 @@ where
 
     /// Builds a lookup table that tells us whether a partition has slot or not.
     ///
-    /// Returns a `&[PartHasSlot]`.
-    async fn get_part_has_slot_table(&mut self) -> Result<&[PartHasSlot], Error> {
-        let default_slot = self.slots_iter()?.next().ok_or("Missing slot info")??.suffix.as_char();
+    /// Returns `Ok(None)` when device slotting is not supported (`get_slot_count()` returns
+    /// `Ok(0)`, `Err(Error::Unsupported)`, or `Err(Error::NotFound)` when no boot control protocol
+    /// is installed). Other errors from `get_slot_count()` or `get_slot_info()` are propagated.
+    async fn get_part_has_slot_table(
+        &mut self,
+        gbl_ops: &mut impl GblOps<'a>,
+        dynamic_parts: Option<&[RawName]>,
+    ) -> Result<Option<&[PartHasSlot]>, Error> {
+        let Some(slot_suffixes) = SlotSuffixMask::new(gbl_ops)? else {
+            return Ok(None);
+        };
 
-        let dynamic_parts = self.get_dynamic_partition_names().await.unwrap_or_default();
+        let owned_dynamic;
+        let dynamic_parts = match dynamic_parts {
+            Some(parts) => parts,
+            None => {
+                owned_dynamic = self.get_dynamic_partition_names(gbl_ops).await.unwrap_or_default();
+                &owned_dynamic
+            }
+        };
         let dynamic_partition_count = dynamic_parts.len();
 
         // The table size could theoretically be as large as the number of total partitions, so
         // stack allocation would be insufficient. We instead dynamically allocate a memory slice
         // on the boot_buffer scratch pad.
+        let disks = self.disks;
         let partition_count: usize =
-            self.disks.iter().map(|b| b.num_partitions().unwrap_or_default()).sum();
+            disks.iter().map(|b| b.num_partitions().unwrap_or_default()).sum();
         let total_partitions = partition_count + dynamic_partition_count;
         let buf = <[PartHasSlot]>::mut_from_prefix_with_elems(
             self.data.boot_buffer.scratch(),
@@ -696,30 +828,23 @@ where
         })?
         .0;
         let mut part_has_slot = SliceVec::new(buf);
-        let gpt_parts = self.disks.iter().flat_map(|blk| {
+        let gpt_parts = disks.iter().flat_map(|blk| {
             (0..blk.num_partitions().unwrap_or_default()).filter_map(move |idx| {
-                let part = blk.get_partition_by_idx(idx).ok()?;
-                let name = part.name().ok()?;
-                RawName::try_from(name).ok()
+                blk.get_partition_by_idx(idx)
+                    .ok()
+                    .and_then(|ptn| RawName::try_from(ptn.name().ok()?).ok())
             })
         });
 
-        let all_parts = gpt_parts.chain(dynamic_parts);
+        let all_parts = gpt_parts.chain(dynamic_parts.iter().copied());
         for raw_part in all_parts {
             let part_name = raw_part.to_str();
-            match split_partition_suffix(part_name) {
+            match slot_suffixes.split(part_name) {
                 None => match part_has_slot.iter().position(|p| p.0.to_str() == part_name) {
-                    None => {
-                        if let Ok(raw_name) = part_name.try_into() {
-                            part_has_slot.push(PartHasSlot(raw_name, PartHasSlot::NO));
-                        }
-                    }
+                    None => part_has_slot.push(PartHasSlot(raw_part, PartHasSlot::NO)),
                     Some(pos) => part_has_slot[pos].1 = PartHasSlot::NO,
                 },
-                Some((name, suffix))
-                    if suffix == default_slot
-                        && part_has_slot.iter().all(|p| p.0.to_str() != name) =>
-                {
+                Some((name, _)) if part_has_slot.iter().all(|p| p.0.to_str() != name) => {
                     if let Ok(base_name) = name.try_into() {
                         part_has_slot.push(PartHasSlot(base_name, PartHasSlot::YES));
                     }
@@ -728,14 +853,18 @@ where
             }
         }
 
-        Ok(part_has_slot.into())
+        Ok(Some(part_has_slot.into()))
     }
 
     /// Reads the super partition and extracts dynamic partition names from LP metadata.
     ///
-    /// Returns an empty list if super partition doesn't exist or metadata parsing fails.
+    /// Deliberately returns an empty list if `super` doesn't exist, cannot be read, or has
+    /// corrupt/erased LP metadata so that GPT and virtual-partition `has-slot` queries remain
+    /// usable during fastboot recovery/unbrick (accepting that a corrupt `super` cannot mask a
+    /// conflicting vendor `has-slot` entry for a dynamic partition).
     async fn get_dynamic_partition_names(
         &mut self,
+        gbl_ops: &mut impl GblOps<'a>,
     ) -> Result<arrayvec::ArrayVec<RawName, 32>, Error> {
         // 256KB is sufficient to read LP geometry + metadata (primary + backup).
         const SUPER_METADATA_SIZE: usize = 256 * 1024;
@@ -769,14 +898,14 @@ where
                     yield_now().await;
                 }
                 Err(e) => {
-                    gbl_println!(self.gbl_ops, "Failed to get partition_io for super: {e}");
+                    gbl_println!(gbl_ops, "Failed to get partition_io for super: {e}");
                     return Ok(result);
                 }
             }
         }
 
         if io.read(0, &mut buffer[..]).await.is_err() {
-            gbl_println!(self.gbl_ops, "Failed to read super partition");
+            gbl_println!(gbl_ops, "Failed to read super partition");
             return Ok(result);
         }
 
@@ -793,7 +922,7 @@ where
         {
             if result.try_push(raw_name).is_err() {
                 gbl_println!(
-                    self.gbl_ops,
+                    gbl_ops,
                     "Warning: dynamic partition list truncated at {} entries, more partitions exist in super",
                     result.len()
                 );
@@ -805,42 +934,54 @@ where
     }
 
     /// "fastboot getvar has-slot:<partition-name-without-slot-suffix>"
+    ///
+    /// Reports `no` for every partition when device slotting is unsupported. Otherwise returns
+    /// `Ok(None)` if the partition is neither in GBL's has-slot table nor on GBL's disks.
     async fn get_var_has_slot<'t, 's>(
         &mut self,
+        gbl_ops: &mut impl GblOps<'a>,
         mut args: impl Iterator<Item = &'t str> + Clone,
+        dynamic_parts: Option<&[RawName]>,
         out: &'s mut [u8],
-    ) -> CommandResult<&'s str> {
-        let part = args.next().ok_or("Missing partition")?;
-        let has_slot = self
-            .get_part_has_slot_table()
-            .await?
-            .iter()
-            .find_map(
-                |PartHasSlot(name, has_slot)| {
-                    if name.to_str() == part {
-                        Some(has_slot)
-                    } else {
-                        None
-                    }
-                },
-            )
-            .copied()
-            .ok_or(Error::NotFound)?;
-        Ok(snprintf!(out, "{}", if has_slot == PartHasSlot::NO { "no" } else { "yes" }))
+    ) -> CommandResult<Option<&'s str>> {
+        let part = next_arg(&mut args).ok_or("Missing partition")?;
+        if part.contains('/') {
+            return Err("Invalid partition".into());
+        }
+        let Some(table) = self.get_part_has_slot_table(gbl_ops, dynamic_parts).await? else {
+            // Without slotting no partition, virtual or not, can have slots.
+            return Ok(Some(snprintf!(out, "no")));
+        };
+        if let Some(PartHasSlot(_, has_slot)) =
+            table.iter().find(|PartHasSlot(name, _)| name.to_str() == part)
+        {
+            let has_slot = if *has_slot == PartHasSlot::NO { "no" } else { "yes" };
+            return Ok(Some(snprintf!(out, "{has_slot}")));
+        }
+        // Not in the table (e.g. `part` is a slotted name). Only let the vendor answer if the
+        // partition doesn't exist on GBL's disks either.
+        match self.partition_size(gbl_ops, part) {
+            Err(GblFastbootError::Libgbl(Error::PartitionNotFound)) => Ok(None),
+            _ => Err(Error::NotFound.into()),
+        }
     }
 
     /// Gets all "has-slot"
     async fn get_all_partition_has_slot(
         &mut self,
+        gbl_ops: &mut impl GblOps<'a>,
+        dynamic_parts: &[RawName],
         responder: &mut impl VarInfoSender,
     ) -> CommandResult<()> {
-        let res = self.get_part_has_slot_table().await;
-        // Variable may be optional. Continues instead of erroring out.
-        if let Some(e) = res.err() {
-            gbl_println!(self.gbl_ops, "Failed to get slot_info for partitions, {e}");
-            return Ok(());
-        }
-        for PartHasSlot(part, has_slot) in res? {
+        let table = match self.get_part_has_slot_table(gbl_ops, Some(dynamic_parts)).await {
+            Ok(Some(table)) => table,
+            Ok(None) => return Ok(()),
+            Err(e) => {
+                gbl_println!(gbl_ops, "Failed to get slot_info for partitions, {e}");
+                return Ok(());
+            }
+        };
+        for PartHasSlot(part, has_slot) in table {
             responder
                 .send_var_info(
                     HAS_SLOT,
@@ -855,11 +996,13 @@ where
     /// Looks up the system fingerprint for `slot_suffix`
     async fn get_system_fingerprint_for_slot<'s>(
         &mut self,
+        gbl_ops: &mut impl GblOps<'a>,
         slot_suffix: &str,
         out: &'s mut [u8],
     ) -> Result<&'s str, Error> {
         // Validate that `slot_suffix` corresponds to a valid slot.
-        self.get_fastboot_slot_info([slot_suffix].into_iter()).map_err(|_| Error::InvalidInput)?;
+        self.get_fastboot_slot_info(gbl_ops, [slot_suffix].into_iter())
+            .map_err(|_| Error::InvalidInput)?;
         let mut suffix_buf = [0u8; 8];
         let ab_suffix_str = snprintf!(suffix_buf, "_{slot_suffix}\0");
         let ab_suffix = CStr::from_bytes_with_nul(ab_suffix_str.as_bytes())
@@ -868,7 +1011,7 @@ where
         while self.tasks.borrow_mut().poll_all() > 0 {
             yield_now().await;
         }
-        let mut avb_ops = GblAvbOps::new(self.gbl_ops, None, &mut [], false);
+        let mut avb_ops = GblAvbOps::new(gbl_ops, None, &mut [], false);
         // Allow verification errors regardless of lock state so `fastboot getvar` can still
         // inspect and report the vbmeta properties; structurally invalid or corrupted vbmeta images
         // are still rejected below.
@@ -923,6 +1066,7 @@ where
     /// Currently only supports system partition.
     async fn get_var_fingerprint<'t, 's>(
         &mut self,
+        gbl_ops: &mut impl GblOps<'a>,
         mut args: impl Iterator<Item = &'t str> + Clone,
         out: &'s mut [u8],
     ) -> CommandResult<&'s str> {
@@ -931,6 +1075,6 @@ where
             .ok_or("Missing partition")?
             .strip_prefix("system_")
             .ok_or("Invalid partition")?;
-        Ok(self.get_system_fingerprint_for_slot(suffix, out).await?)
+        Ok(self.get_system_fingerprint_for_slot(gbl_ops, suffix, out).await?)
     }
 }

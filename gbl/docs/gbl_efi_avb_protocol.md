@@ -159,7 +159,10 @@ copied into `BaseName` without termination.
 
 Points to a buffer of size `BaseNameLen`. On output, the buffer should be filled
 with the base (slotless) partition name as UTF-8, e.g. `boot` rather than
-`boot_a`.
+`boot_a`. GBL only strips suffixes that match a device slot reported by
+`GBL_EFI_BOOT_CONTROL_PROTOCOL`; a partition whose trailing `_<letter>` is not a
+device slot (e.g. `protect_f` on an A/B device), or any partition on a device
+without slotting, is matched by its full name.
 
 Termination is not required, and no embedded terminators are allowed within the
 output `BaseNameLen`.
