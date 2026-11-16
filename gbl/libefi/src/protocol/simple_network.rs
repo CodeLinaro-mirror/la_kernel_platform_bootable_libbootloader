@@ -19,7 +19,7 @@ use crate::{
     protocol::{Protocol, ProtocolInfo, Requirement},
     versioned_protocol,
 };
-use core::ffi::c_void;
+use core::{ffi::c_void, ptr::NonNull};
 use efi_types::{
     EfiGuid, EfiMacAddress, EfiSimpleNetworkMode, EfiSimpleNetworkProtocol,
     EFI_SIMPLE_NETWORK_PROTOCOL_GUID_U64_0, EFI_SIMPLE_NETWORK_PROTOCOL_GUID_U64_1,
@@ -132,36 +132,43 @@ impl<'a> Protocol<'a, SimpleNetworkProtocol> {
         Ok(())
     }
 
-    /// Wrapper of `EFI_SIMPLE_NETWORK.Transmit()`
+    /// Wrapper of `EFI_SIMPLE_NETWORK.Transmit()`.
     ///
     /// # Safety
     ///
-    /// * `buf` needs to be a valid buffer.
-    /// * There should not be any existing references to memory pointed by `buf`.
-    /// * Because `buf` is internally retained by the network. `buf` should remain valid and not
-    ///   dereferenced until either 1) the buffer address re-appears in `recycled_buffer` from
-    ///   `Self::get_status()` or 2) Self::Shutdown() is called and returns either Ok(()) or
-    ///   EFI_STATUS_NOT_STARTED.
+    /// The caller must ensure that:
+    /// * `buf` points to a single live allocation of `buf.len()` initialized bytes valid for reads
+    ///   and writes.
+    /// * No Rust references (`&` or `&mut`) or concurrent accesses alias the memory pointed to by
+    ///   `buf` during the call.
+    /// * If this method returns `Ok(())`, the network interface retains `buf` asynchronously: the
+    ///   memory pointed to by `buf` must remain live and must not be read, written, or referenced
+    ///   by Rust until either 1) its address is returned in `recycle_buffer` by
+    ///   [`Self::get_status`] or 2) [`Self::shutdown`] returns `Ok(())` or
+    ///   `Err(Error::NotStarted)`. (If this method returns `Err(_)`, `buf` is not retained.)
     pub unsafe fn transmit(
         &self,
         header_size: usize,
-        buf: *mut [u8],
+        buf: NonNull<[u8]>,
         mut src: EfiMacAddress,
         mut dest: EfiMacAddress,
         mut protocol: u16,
     ) -> Result<()> {
-        // SAFETY: function safety docs require valid `buf`.
-        let buf = unsafe { buf.as_mut() }.unwrap();
         // SAFETY:
-        // See safety reasoning of `start()`.
-        // All pointers passed are valid, outlive the call and are not retained by the call.
+        // * `self.interface_ptr()` points to a valid `EfiSimpleNetworkProtocol` instance as
+        //   established by `Protocol::new()`, outlives the call, and is not retained.
+        // * `&mut src`, `&mut dest`, and `&mut protocol` point to local stack variables that are
+        //   valid for the duration of the call and are not retained by the network interface.
+        // * `buf` is non-null by type, and by the caller's `# Safety` contract points to
+        //   `buf.len()` live, initialized, unaliased bytes that—if `transmit` succeeds—remain
+        //   valid and unaccessed until recycled by `get_status()` or released by `shutdown()`.
         unsafe {
             efi_call!(
                 self.interface().transmit,
                 self.interface_ptr(),
                 header_size,
                 buf.len(),
-                buf.as_mut_ptr() as *mut _,
+                buf.cast::<c_void>().as_ptr(),
                 &mut src,
                 &mut dest,
                 &mut protocol
@@ -219,4 +226,84 @@ impl<'a> Protocol<'a, SimpleNetworkProtocol> {
 /// A helper to convert an `Option<&mut T>` to `*mut T`. None maps to NULL.
 fn option_ref_mut_to_pointer<T>(option: Option<&mut T>) -> *mut T {
     option.map(|t| t as *mut _).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::test::run_test_with_mock_protocol;
+    use efi_types::{EfiStatus, EFI_STATUS_NOT_READY, EFI_STATUS_SUCCESS};
+
+    #[test]
+    fn test_transmit_forwards_raw_buffer_and_headers() {
+        const HEADER_SIZE: usize = 14;
+        const PAYLOAD: [u8; 6] = [0xde, 0xad, 0xbe, 0xef, 0x01, 0x02];
+        const PROTOCOL: u16 = 0x86dd;
+
+        unsafe extern "efiapi" fn c_transmit(
+            _: *mut EfiSimpleNetworkProtocol,
+            header_size: usize,
+            buf_size: usize,
+            buf: *mut c_void,
+            src: *mut EfiMacAddress,
+            dest: *mut EfiMacAddress,
+            protocol: *mut u16,
+        ) -> EfiStatus {
+            assert_eq!(header_size, HEADER_SIZE);
+            assert_eq!(buf_size, PAYLOAD.len());
+            assert!(!buf.is_null(), "expected non-null transmit buffer");
+            // SAFETY: `buf`, `src`, `dest`, and `protocol` are valid for the duration of this
+            // mock callback as passed by `SimpleNetworkProtocol::transmit`.
+            unsafe {
+                assert_eq!(core::slice::from_raw_parts(buf.cast::<u8>(), buf_size), &PAYLOAD);
+                assert_eq!((*src).addr[0], 0x11);
+                assert_eq!((*dest).addr[0], 0x22);
+                assert_eq!(*protocol, PROTOCOL);
+            }
+            EFI_STATUS_SUCCESS
+        }
+
+        let mut src = EfiMacAddress::default();
+        src.addr[0] = 0x11;
+        let mut dest = EfiMacAddress::default();
+        dest.addr[0] = 0x22;
+        let mut frame = PAYLOAD;
+        let raw_buf = NonNull::from(&mut frame[..]);
+
+        let c_interface =
+            EfiSimpleNetworkProtocol { transmit: Some(c_transmit), ..Default::default() };
+        run_test_with_mock_protocol::<SimpleNetworkProtocol>(c_interface, |snp| {
+            // SAFETY: `raw_buf` points to `frame`, which has no active references and outlives the
+            // mock callback (which does not retain `raw_buf`).
+            assert_eq!(unsafe { snp.transmit(HEADER_SIZE, raw_buf, src, dest, PROTOCOL) }, Ok(()));
+        });
+    }
+
+    #[test]
+    fn test_transmit_propagates_not_ready() {
+        unsafe extern "efiapi" fn c_not_ready(
+            _: *mut EfiSimpleNetworkProtocol,
+            _: usize,
+            _: usize,
+            _: *mut c_void,
+            _: *mut EfiMacAddress,
+            _: *mut EfiMacAddress,
+            _: *mut u16,
+        ) -> EfiStatus {
+            EFI_STATUS_NOT_READY
+        }
+
+        let mut frame = [0u8; 4];
+        let raw_buf = NonNull::from(&mut frame[..]);
+        let c_interface =
+            EfiSimpleNetworkProtocol { transmit: Some(c_not_ready), ..Default::default() };
+        run_test_with_mock_protocol::<SimpleNetworkProtocol>(c_interface, |snp| {
+            // SAFETY: `raw_buf` points to `frame`, has no active references, and is not retained
+            // when `transmit` returns `Err(Error::NotReady)`.
+            let res = unsafe {
+                snp.transmit(0, raw_buf, EfiMacAddress::default(), EfiMacAddress::default(), 0)
+            };
+            assert_eq!(res, Err(Error::NotReady));
+        });
+    }
 }

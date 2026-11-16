@@ -23,7 +23,7 @@ use alloc::{boxed::Box, vec::Vec};
 use core::{
     ffi::c_void,
     ops::Deref,
-    ptr::null_mut,
+    ptr::{null_mut, NonNull},
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
@@ -80,6 +80,13 @@ const SNP_EXTRA_RX_BUFFER_SIZE: usize = 512 * 1024;
 /// acknowledgement, costs several microseconds of firmware calls, so batching saves CPU time during
 /// downloads while still yielding right after each batch when the ring is empty.
 const BULK_RECEIVE_POLL_INTERVAL: Duration = Duration::from_micros(100);
+
+/// Maximum time to wait for an in-flight TX buffer to be recycled before resetting the network.
+const TX_RECYCLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum time to wait for the NIC transmit queue to accept a frame on `Error::NotReady` before
+/// dropping it and letting upper-layer protocols retransmit or time out.
+const TX_READY_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Converts smoltcp [RecvError] to unified [Error].
 fn recv_to_unified(err: RecvError) -> Error {
@@ -157,25 +164,36 @@ pub struct EfiNetworkDevice<'a> {
     // `ExclusiveProtocol` guard always runs after `shutdown()`.
     protocol: NetworkProtocol<'a>,
     rx_frame: Box<[u8; ETHERNET_FRAME_BUFFER_SIZE]>,
-    tx_frames: Vec<*mut [u8; ETHERNET_FRAME_BUFFER_SIZE]>,
-    tx_frame_curr: usize, // Circular next index into tx_frames.
+    tx_frames: Vec<TxFrame>,
     efi_entry: &'a EfiEntry,
+}
+
+/// A transmit frame buffer in [`EfiNetworkDevice`]'s pool.
+struct TxFrame {
+    // Safety invariant: Allocated via `Box::into_raw(Box::new([0u8; ETHERNET_FRAME_BUFFER_SIZE]))`
+    // in `EfiNetworkDevice::new`, pairwise distinct from every other `TxFrame::buf`, and valid
+    // until `EfiNetworkDevice::drop` frees it after shutting down the network protocol. When
+    // `!self.in_flight`, the network protocol does not retain or access `self.buf`.
+    buf: NonNull<[u8; ETHERNET_FRAME_BUFFER_SIZE]>,
+    in_flight: bool,
 }
 
 impl<'a> EfiNetworkDevice<'a> {
     /// Creates a new instance. Allocates `extra_tx_frames+1` number of TX frames.
     fn new(protocol: NetworkProtocol<'a>, extra_tx_frames: usize, efi_entry: &'a EfiEntry) -> Self {
-        let mut ret = Self {
+        let tx_frames = (0..extra_tx_frames + 1)
+            .map(|_| TxFrame {
+                buf: NonNull::new(Box::into_raw(Box::new([0u8; ETHERNET_FRAME_BUFFER_SIZE])))
+                    .unwrap(),
+                in_flight: false,
+            })
+            .collect();
+        Self {
             protocol,
             rx_frame: Box::new([0u8; ETHERNET_FRAME_BUFFER_SIZE]),
-            tx_frames: vec![core::ptr::null_mut(); extra_tx_frames + 1],
-            tx_frame_curr: 0,
+            tx_frames,
             efi_entry,
-        };
-        ret.tx_frames
-            .iter_mut()
-            .for_each(|v| *v = Box::into_raw(Box::new([0u8; ETHERNET_FRAME_BUFFER_SIZE])));
-        ret
+        }
     }
 }
 
@@ -190,12 +208,17 @@ impl Drop for EfiNetworkDevice<'_> {
         }
 
         // Deallocate TX frames.
-        self.tx_frames.iter_mut().for_each(|v| {
+        for frame in self.tx_frames.drain(..) {
             // SAFETY:
-            // Each pointer is created by `Box::new()` in `EfiNetworkDevice::new()`. Thus the
-            // pointer is valid and layout matches.
-            drop(unsafe { Box::<[u8; ETHERNET_FRAME_BUFFER_SIZE]>::from_raw(*v) });
-        });
+            // * By `TxFrame::buf`'s safety invariant, `frame.buf` was created via
+            //   `Box::into_raw(Box::new([0u8; ETHERNET_FRAME_BUFFER_SIZE]))` with matching layout
+            //   and global allocator, and is freed only once here as `drain(..)` removes each
+            //   `TxFrame`.
+            // * `self.protocol.shutdown()` above returned `Ok(())` or `Error::NotStarted`,
+            //   releasing any pending transmit buffers held by the network interface, and `&mut
+            //   self` guarantees no `TxToken` borrows `self.tx_frames`.
+            drop(unsafe { Box::<[u8; ETHERNET_FRAME_BUFFER_SIZE]>::from_raw(frame.buf.as_ptr()) });
+        }
     }
 }
 
@@ -231,7 +254,6 @@ impl<'a> Device for EfiNetworkDevice<'a> {
                 TxToken {
                     protocol: &self.protocol,
                     tx_frames: &mut self.tx_frames[..],
-                    curr: &mut self.tx_frame_curr,
                     efi_entry: self.efi_entry,
                 },
             )),
@@ -243,7 +265,6 @@ impl<'a> Device for EfiNetworkDevice<'a> {
         Some(TxToken {
             protocol: &self.protocol,
             tx_frames: &mut self.tx_frames[..],
-            curr: &mut self.tx_frame_curr,
             efi_entry: self.efi_entry,
         })
     }
@@ -263,27 +284,133 @@ impl phy::RxToken for RxToken<'_> {
 
 /// In smoltcp, a `TxToken` is used to transmit a frame when consumed.
 pub struct TxToken<'a: 'b, 'b> {
-    tx_frames: &'b mut [*mut [u8; ETHERNET_FRAME_BUFFER_SIZE]],
-    curr: &'b mut usize,
+    tx_frames: &'b mut [TxFrame],
     protocol: &'b Protocol<'a, SimpleNetworkProtocol>,
     efi_entry: &'a EfiEntry,
 }
 
 impl TxToken<'_, '_> {
-    /// Tries to allocate a send buffer.
-    fn try_get_buffer(&mut self) -> Option<*mut [u8; ETHERNET_FRAME_BUFFER_SIZE]> {
+    /// Polls `get_status` once to dequeue a recycled TX buffer pointer, marking any matching
+    /// in-flight pool slot idle. Returns `true` if a non-null pointer was dequeued.
+    fn poll_recycled_tx_buffer(&mut self) -> bool {
         let mut ptr: *mut c_void = null_mut();
         let mut interrupt_status = 0u32;
-        // Recyle a buffer or take one from `tx_frames`.
-        match self.protocol.get_status(Some(&mut interrupt_status), Some(&mut ptr)) {
-            Ok(()) if self.tx_frames.contains(&(ptr as *mut _)) => Some(ptr as *mut _),
-            _ if *self.curr < self.tx_frames.len() => {
-                // If we can't recycle a buffer, see if we can take one from the pool.
-                let res = *self.curr;
-                *self.curr += 1;
-                Some(self.tx_frames[res])
+        if self.protocol.get_status(Some(&mut interrupt_status), Some(&mut ptr)).is_err()
+            || ptr.is_null()
+        {
+            return false;
+        }
+        if let Some(frame) = self
+            .tx_frames
+            .iter_mut()
+            .find(|f| f.in_flight && ptr == f.buf.cast::<c_void>().as_ptr())
+        {
+            frame.in_flight = false;
+        }
+        true
+    }
+
+    /// Tries to allocate an idle send buffer slot, polling `get_status` to reclaim completed
+    /// in-flight buffers and drain stale recycled addresses.
+    ///
+    /// # Safety-usable invariant
+    ///
+    /// If this returns `Some(idx)`, then `idx < self.tx_frames.len()` and
+    /// `!self.tx_frames[idx].in_flight`.
+    fn try_get_buffer(&mut self) -> Option<usize> {
+        // UEFI `SimpleNetworkProtocol::GetStatus()` dequeues one recycled TX buffer pointer per
+        // call until `ptr` is null, and drivers may retain queued addresses across `Shutdown()` /
+        // `Initialize()` or report foreign or duplicate addresses. Drain ready entries up to a
+        // bounded poll cap so non-compliant firmware returning non-null pointers indefinitely
+        // cannot hang transmission.
+        const MAX_TX_RECYCLE_POLLS: usize = 256;
+
+        for _ in 0..MAX_TX_RECYCLE_POLLS {
+            if !self.poll_recycled_tx_buffer() {
+                break;
             }
-            _ => None,
+        }
+
+        self.tx_frames.iter().position(|f| !f.in_flight)
+    }
+
+    /// Acquires an idle TX buffer slot, resetting the network if TX buffer recycling times out.
+    ///
+    /// # Safety-usable invariant
+    ///
+    /// The returned `idx` satisfies `idx < self.tx_frames.len()` and
+    /// `!self.tx_frames[idx].in_flight`.
+    fn acquire_buffer(&mut self) -> usize {
+        loop {
+            // A transmit buffer is almost always free, so only arm a UEFI timeout timer if none is
+            // immediately available.
+            if let Some(idx) = self.try_get_buffer() {
+                return idx;
+            }
+            match loop_with_timeout(self.efi_entry, TX_RECYCLE_TIMEOUT, || {
+                self.try_get_buffer().ok_or(false)
+            }) {
+                Ok(Some(idx)) => return idx,
+                Ok(None) => {
+                    // Some UEFI firmware has internal network services that also recycle buffers,
+                    // hijacking ours so they are never returned to us. Shutting down and restarting
+                    // the network releases all pending send/receive buffers internally retained.
+                    efi_println!(
+                        self.efi_entry,
+                        "Timeout recycling TX buffers. Resetting network."
+                    );
+                    // Panics if this fails, as we have effectively lost control over the network's
+                    // use of our TX buffers.
+                    reset_simple_network(self.protocol).unwrap();
+                    for frame in self.tx_frames.iter_mut() {
+                        frame.in_flight = false;
+                    }
+                }
+                Err(_) => {} // `loop_with_timeout` failure. Try again.
+            }
+        }
+    }
+
+    /// Transmits the `len`-byte frame in `self.tx_frames[idx]`, retrying up to `TX_READY_TIMEOUT`
+    /// on `Error::NotReady` and marking the slot `in_flight` if queued.
+    fn transmit_slot(&mut self, idx: usize, len: usize) {
+        assert!(!self.tx_frames[idx].in_flight, "TX slot already in flight");
+        assert!(len <= ETHERNET_FRAME_BUFFER_SIZE, "TX frame length exceeds buffer");
+        let send_buf = NonNull::slice_from_raw_parts(self.tx_frames[idx].buf.cast::<u8>(), len);
+
+        let try_send = |protocol: &Protocol<'_, SimpleNetworkProtocol>| {
+            // SAFETY:
+            // * `send_buf` points to `len <= ETHERNET_FRAME_BUFFER_SIZE` live, initialized bytes in
+            //   `self.tx_frames[idx].buf`, which outlives network shutdown in
+            //   `EfiNetworkDevice::drop`.
+            // * `!self.tx_frames[idx].in_flight` holds on entry (and remains `false` across any
+            //   `Err(Error::NotReady)` retries, as `poll_recycled_tx_buffer` only clears `in_flight`
+            //   flags), and `&mut self` ensures no Rust reference aliases `send_buf`.
+            // * If `transmit` returns `Ok(())`, `transmit_slot` sets `in_flight = true` before
+            //   returning so the buffer is not reused or accessed until `get_status()` recycles it
+            //   or `reset_simple_network` / `Drop` shuts down the network.
+            unsafe { protocol.transmit(0, send_buf, Default::default(), Default::default(), 0) }
+        };
+
+        // Only arm a UEFI timeout timer if the NIC DMA TX queue reports `Error::NotReady`.
+        let transmitted = match try_send(self.protocol) {
+            Ok(()) => true,
+            Err(Error::NotReady) => matches!(
+                loop_with_timeout(self.efi_entry, TX_READY_TIMEOUT, || {
+                    let _ = self.poll_recycled_tx_buffer();
+                    match try_send(self.protocol) {
+                        Ok(()) => Ok(true),
+                        Err(Error::NotReady) => Err(false),
+                        Err(_) => Ok(false),
+                    }
+                }),
+                Ok(Some(true))
+            ),
+            Err(_) => false,
+        };
+
+        if transmitted {
+            self.tx_frames[idx].in_flight = true;
         }
     }
 }
@@ -293,67 +420,22 @@ impl phy::TxToken for TxToken<'_, '_> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        loop {
-            // A transmit buffer is almost always free, so only arm a UEFI timeout timer if none is
-            // immediately available.
-            let buffer = match self.try_get_buffer() {
-                Some(v) => Ok(Some(v)),
-                None => loop_with_timeout(self.efi_entry, Duration::from_secs(5), || {
-                    self.try_get_buffer().ok_or(false)
-                }),
-            };
-            match buffer {
-                Ok(Some(send_buffer)) => {
-                    // SAFETY:
-                    // * The pointer is confirmed to come from one of `self.tx_frames`. It's
-                    //   created via `Box::new()` in `EfiNetworkDevice::new()`. Thus it is properly
-                    //   aligned, dereferenceable and initialized.
-                    // * The pointer is either recycled from `self.protocol.get_status` or newly
-                    //   allocated from `self.tx_frames`. Thus There's no other references to it.
-                    // * The reference is only used for passing to `f` and goes out of scope
-                    //   immediately after.
-                    let result = f(&mut unsafe { send_buffer.as_mut() }.unwrap()[..len]);
+        assert!(len <= ETHERNET_FRAME_BUFFER_SIZE, "TX frame length exceeds buffer");
+        let idx = self.acquire_buffer();
 
-                    // SAFETY:
-                    // * `send_buffer` comes from `EfiNetworkDevice::tx_frames`. It has a valid
-                    //   length at least `len`. `EfiNetworkDevice` shuts down network on drop. Thus
-                    //   the transmit buffer remains valid throughout the operation of the network
-                    //   protocol.
-                    // * `send_buffer` is either recycled from `self.protocol.get_status()` or newly
-                    //   allocated from `self.tx_frames`. There's no other references to it.
-                    // * `self.curr` stricly increases for each new allocation until
-                    //   `reset_simple_network()`. Thus there'll be no other references to the buffer
-                    //    until it is either recycled or `reset_simple_network()` is called.
-                    let _ = unsafe {
-                        self.protocol.transmit(
-                            0,
-                            send_buffer.as_mut().unwrap().get_mut(..len).unwrap(),
-                            Default::default(), // Src mac address don't care
-                            Default::default(), // Dest mac address don't care
-                            0,
-                        )
-                    };
+        let mut send_buf = NonNull::slice_from_raw_parts(self.tx_frames[idx].buf.cast::<u8>(), len);
+        // SAFETY:
+        // * By `TxFrame::buf`'s safety invariant, `self.tx_frames[idx].buf` points to a live,
+        //   initialized `[u8; ETHERNET_FRAME_BUFFER_SIZE]` allocation until
+        //   `EfiNetworkDevice::drop` (which cannot run while `self` borrows `&mut self.tx_frames`),
+        //   and `len <= ETHERNET_FRAME_BUFFER_SIZE` is checked above.
+        // * By `acquire_buffer`'s safety-usable invariant, `!self.tx_frames[idx].in_flight`, so
+        //   the network interface does not retain or access this buffer, and all `TxFrame::buf`
+        //   allocations are pairwise distinct.
+        let result = f(unsafe { send_buf.as_mut() });
 
-                    return result;
-                }
-                Ok(None) => {
-                    // Some UEFI firmware has internal network service that also recycle buffers,
-                    // in which case our buffer may be hijacked and will never be returned from our
-                    // call. If we run into this case, shutdown and restart the network and try
-                    // again. Shutting down network releases all pending send/receive buffers
-                    // internally retained.
-                    efi_println!(
-                        self.efi_entry,
-                        "Timeout recycling TX buffers. Resetting network."
-                    );
-                    // Panics if this fails, as we have effectively lost control over network's
-                    // used of buffers.
-                    reset_simple_network(self.protocol).unwrap();
-                    *self.curr = 0;
-                }
-                _ => {} // `loop_with_timeout` failure. Try again.
-            };
-        }
+        self.transmit_slot(idx, len);
+        result
     }
 }
 
@@ -1458,5 +1540,388 @@ mod test {
             Err(Error::Disconnected)
         );
         assert_eq!(rx_polls.load(Ordering::Relaxed), 1);
+    }
+
+    fn make_tx_test_snp(
+        fake: &Arc<FakeSnp>,
+    ) -> (
+        SimpleNetworkProtocol,
+        Arc<Mutex<std::collections::VecDeque<usize>>>,
+        Arc<Mutex<Vec<usize>>>,
+    ) {
+        let recycled = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let transmitted = Arc::new(Mutex::new(Vec::new()));
+        let mut snp = fake.snp();
+
+        let recycled_status = recycled.clone();
+        snp.expect_get_status_raw().returning(move |_, tx_buf| {
+            if let Some(addr) = recycled_status.lock().unwrap().pop_front() {
+                // SAFETY: `tx_buf` points to the caller's local `ptr` output variable in
+                // `SimpleNetworkProtocol::get_status`.
+                unsafe { *tx_buf = addr as *mut c_void };
+            }
+            Ok(())
+        });
+
+        let transmitted_tx = transmitted.clone();
+        snp.expect_transmit().returning(move |_, buf, _, _, _| {
+            transmitted_tx.lock().unwrap().push(buf.cast::<u8>().as_ptr() as usize);
+            Ok(())
+        });
+
+        (snp, recycled, transmitted)
+    }
+
+    #[test]
+    fn test_tx_token_reentry_with_stale_recycled_pool_buffer_does_not_alias() {
+        use smoltcp::phy::TxToken as _;
+
+        let installed = MockEfi::new().install();
+        let fake = FakeSnp::new(INITIALIZED);
+        let (snp, recycled, transmitted) = make_tx_test_snp(&fake);
+        let mut dev = EfiNetworkDevice::new(NetworkProtocol::Shared(snp), 1, installed.entry());
+
+        // Simulate session re-entry where UEFI pool allocation reused `tx_frames[0]`'s address
+        // while the SNP driver's `GetStatus()` queue still holds stale entries from an earlier
+        // session.
+        let buf0 = dev.tx_frames[0].buf.as_ptr() as usize;
+        let buf1 = dev.tx_frames[1].buf.as_ptr() as usize;
+        recycled.lock().unwrap().extend([0xdead_beefusize, buf0]);
+
+        // Packet 1 drains the stale entries and puts `buf0` in flight with `[0x11; 4]`.
+        dev.transmit(Instant::ZERO).unwrap().consume(4, |b| b.copy_from_slice(&[0x11; 4]));
+        assert_eq!(transmitted.lock().unwrap().as_slice(), &[buf0]);
+        assert!(recycled.lock().unwrap().is_empty(), "stale recycled pointers must be drained");
+
+        // Packet 2 arrives before Packet 1 completes (`GetStatus()` returns null): it must use
+        // `buf1` rather than handing out `buf0` a second time while `buf0` is in flight.
+        dev.transmit(Instant::ZERO).unwrap().consume(4, |b| b.copy_from_slice(&[0x22; 4]));
+        assert_eq!(transmitted.lock().unwrap().as_slice(), &[buf0, buf1]);
+        // SAFETY: `buf0` is a live `[u8; ETHERNET_FRAME_BUFFER_SIZE]` owned by `dev` until drop,
+        // and no mutable reference to it exists outside `consume`.
+        let buf0_payload = unsafe { core::slice::from_raw_parts(buf0 as *const u8, 4) };
+        assert_eq!(buf0_payload, &[0x11; 4]);
+    }
+
+    #[test]
+    fn test_tx_token_ignores_stale_and_duplicate_recycled_buffers() {
+        use smoltcp::phy::TxToken as _;
+
+        let installed = MockEfi::new().install();
+        let fake = FakeSnp::new(INITIALIZED);
+        let (snp, recycled, transmitted) = make_tx_test_snp(&fake);
+        let mut dev = EfiNetworkDevice::new(NetworkProtocol::Shared(snp), 1, installed.entry());
+
+        // Packet 1 and Packet 2 allocate the two distinct pool frames `buf0` and `buf1`.
+        dev.transmit(Instant::ZERO).unwrap().consume(4, |b| b.copy_from_slice(&[0x11; 4]));
+        dev.transmit(Instant::ZERO).unwrap().consume(4, |b| b.copy_from_slice(&[0x22; 4]));
+        let (buf0, buf1) = {
+            let tx = transmitted.lock().unwrap();
+            assert_eq!(tx.len(), 2);
+            assert_ne!(tx[0], tx[1], "initial transmits must use distinct frame buffers");
+            (tx[0], tx[1])
+        };
+
+        // `buf0` and `buf1` complete, with a foreign pointer and a duplicate/stale `buf0` queued
+        // in `GetStatus()` between them.
+        recycled.lock().unwrap().extend([buf0, 0xdead_beefusize, buf0, buf1]);
+
+        // Packet 3 drains ready entries (deduplicating `buf0`) and puts `buf0` in flight with
+        // payload `[0x33; 4]`.
+        dev.transmit(Instant::ZERO).unwrap().consume(4, |b| b.copy_from_slice(&[0x33; 4]));
+        assert_eq!(transmitted.lock().unwrap()[2], buf0);
+
+        // While Packet 3 is still DMA in-flight in `buf0`, Packet 4 must select `buf1` and leave
+        // `buf0`'s in-flight payload intact.
+        dev.transmit(Instant::ZERO).unwrap().consume(4, |b| b.copy_from_slice(&[0x44; 4]));
+        assert_eq!(transmitted.lock().unwrap()[3], buf1);
+        // SAFETY: `buf0` is a live `[u8; ETHERNET_FRAME_BUFFER_SIZE]` owned by `dev` until drop,
+        // and no mutable reference to it exists outside `consume`.
+        let buf0_payload = unsafe { core::slice::from_raw_parts(buf0 as *const u8, 4) };
+        assert_eq!(buf0_payload, &[0x33; 4]);
+    }
+
+    static TIMEOUT_MOCK_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn test_tx_token_drains_stale_recycled_buffers_across_timeout_reset() {
+        use smoltcp::phy::TxToken as _;
+
+        let _timeout_guard = TIMEOUT_MOCK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut mock_efi = MockEfi::new();
+        mock_efi.con_out.expect_write_str().returning(|_| Ok(()));
+        let installed = mock_efi.install();
+
+        let fake = FakeSnp::new(INITIALIZED);
+        let (snp, recycled, transmitted) = make_tx_test_snp(&fake);
+        let mut dev = EfiNetworkDevice::new(NetworkProtocol::Shared(snp), 1, installed.entry());
+        dev.transmit(Instant::ZERO).unwrap().consume(4, |b| b.copy_from_slice(&[0x11; 4]));
+        dev.transmit(Instant::ZERO).unwrap().consume(4, |b| b.copy_from_slice(&[0x22; 4]));
+        let (buf0, buf1) = {
+            let tx = transmitted.lock().unwrap();
+            (tx[0], tx[1])
+        };
+
+        // Both TX slots are now in flight. Simulate a TX recycle timeout where `Shutdown()` +
+        // `Initialize()` inside `reset_simple_network()` leaves stale recycled TX entries
+        // (`[0xfeed_face, buf0]`) queued in `GetStatus()`.
+        let recycled_on_timeout = recycled.clone();
+        let timeout_ctx = Timeout::new_context();
+        timeout_ctx.expect().times(1).return_once(move |_, _| {
+            let mut timeout = Timeout::default();
+            let mut checks = 0;
+            timeout.expect_check().returning(move || {
+                checks += 1;
+                if checks == 1 {
+                    Ok(false)
+                } else {
+                    recycled_on_timeout.lock().unwrap().extend([0xfeed_faceusize, buf0]);
+                    Ok(true)
+                }
+            });
+            Ok(timeout)
+        });
+
+        // Packet 3 times out, resets the network, drains `[0xfeed_face, buf0]`, and transmits
+        // `[0xaa; 4]` using `buf0`.
+        dev.transmit(Instant::ZERO).unwrap().consume(4, |b| b.copy_from_slice(&[0xaa; 4]));
+        drop(timeout_ctx);
+        assert_eq!(fake.resets(), 1);
+        assert_eq!(fake.invalid_calls(), 0);
+        assert_eq!(transmitted.lock().unwrap()[2], buf0);
+        assert!(
+            recycled.lock().unwrap().is_empty(),
+            "stale recycled TX pointers must be drained before transmitting",
+        );
+
+        // Immediately transmit Packet 4 while Packet 3 (`buf0`) is still in flight (`GetStatus()`
+        // returns null). Packet 4 must use `buf1` rather than aliasing `buf0`.
+        dev.transmit(Instant::ZERO).unwrap().consume(4, |b| b.copy_from_slice(&[0xbb; 4]));
+        assert_eq!(transmitted.lock().unwrap()[3], buf1);
+        // SAFETY: `buf0` is a live `[u8; ETHERNET_FRAME_BUFFER_SIZE]` owned by `dev` until drop,
+        // and no mutable reference to it exists outside `consume`.
+        let buf0_payload = unsafe { core::slice::from_raw_parts(buf0 as *const u8, 4) };
+        assert_eq!(buf0_payload, &[0xaa; 4]);
+    }
+
+    #[test]
+    fn test_tx_token_transmit_error_keeps_slot_idle_and_bounds_stale_polls() {
+        use smoltcp::phy::TxToken as _;
+
+        let installed = MockEfi::new().install();
+        let get_status_calls = Arc::new(AtomicU32::new(0));
+        let fail_transmit = Arc::new(AtomicBool::new(true));
+        let transmitted: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let mut snp = FakeSnp::new(INITIALIZED).snp();
+        let calls_clone = get_status_calls.clone();
+        snp.expect_get_status_raw().returning(move |_, tx_buf| {
+            calls_clone.fetch_add(1, Ordering::Relaxed);
+            // Broken firmware endlessly reporting a foreign non-null recycled buffer pointer.
+            // SAFETY: `tx_buf` points to the caller's local `ptr` output variable in
+            // `SimpleNetworkProtocol::get_status`.
+            unsafe { *tx_buf = 0xbad0_c0deusize as *mut c_void };
+            Ok(())
+        });
+        let fail_clone = fail_transmit.clone();
+        let transmitted_tx = transmitted.clone();
+        snp.expect_transmit().returning(move |_, buf, _, _, _| {
+            if fail_clone.swap(false, Ordering::Relaxed) {
+                return Err(Error::DeviceError);
+            }
+            transmitted_tx.lock().unwrap().push(buf.cast::<u8>().as_ptr() as usize);
+            Ok(())
+        });
+
+        // Single-slot pool (`extra_tx_frames = 0`).
+        let mut dev = EfiNetworkDevice::new(NetworkProtocol::Shared(snp), 0, installed.entry());
+
+        // First `transmit` fails with `DeviceError`: the drain loop must terminate after a bounded
+        // number of `get_status` polls, and the rejected buffer must remain idle (`!in_flight`).
+        dev.transmit(Instant::ZERO).unwrap().consume(4, |b| b.copy_from_slice(&[0x55; 4]));
+        let first_polls = get_status_calls.load(Ordering::Relaxed);
+        assert!(
+            (1..=256).contains(&first_polls),
+            "expected bounded stale get_status polling, got {first_polls}",
+        );
+        assert!(transmitted.lock().unwrap().is_empty(), "failed transmit must not record success");
+
+        // Second `transmit` immediately reuses the single slot without timing out.
+        dev.transmit(Instant::ZERO).unwrap().consume(4, |b| b.copy_from_slice(&[0x66; 4]));
+        assert_eq!(transmitted.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_tx_token_retries_not_ready_until_ready() {
+        use smoltcp::phy::TxToken as _;
+
+        let _timeout_guard = TIMEOUT_MOCK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let installed = MockEfi::new().install();
+        let fake = FakeSnp::new(INITIALIZED);
+        let recycled = Arc::new(Mutex::new(std::collections::VecDeque::<usize>::new()));
+        let transmitted = Arc::new(Mutex::new(Vec::<(usize, Vec<u8>)>::new()));
+        let attempts = Arc::new(AtomicU32::new(0));
+
+        let mut snp = fake.snp();
+        let recycled_status = recycled.clone();
+        snp.expect_get_status_raw().returning(move |_, tx_buf| {
+            if let Some(addr) = recycled_status.lock().unwrap().pop_front() {
+                // SAFETY: `tx_buf` points to the caller's local `ptr` output variable in
+                // `SimpleNetworkProtocol::get_status`.
+                unsafe { *tx_buf = addr as *mut c_void };
+            }
+            Ok(())
+        });
+
+        let attempts_tx = attempts.clone();
+        let recycled_tx = recycled.clone();
+        let transmitted_tx = transmitted.clone();
+        snp.expect_transmit().returning(move |_, buf, _, _, _| {
+            let call = attempts_tx.fetch_add(1, Ordering::Relaxed) + 1;
+            // Packet 1 (`call == 1`) succeeds immediately; Packet 2 gets `NotReady` on `call == 2`
+            // and `call == 3` (with `buf0` completing on `call == 3`) before succeeding on
+            // `call == 4`.
+            match call {
+                2 => return Err(Error::NotReady),
+                3 => {
+                    let buf0 = transmitted_tx.lock().unwrap()[0].0;
+                    recycled_tx.lock().unwrap().push_back(buf0);
+                    return Err(Error::NotReady);
+                }
+                _ => {}
+            }
+            // SAFETY: `buf` points to a live `[u8]` slice prepared by `TxToken::consume`.
+            let bytes = unsafe { buf.as_ref() }.to_vec();
+            transmitted_tx.lock().unwrap().push((buf.cast::<u8>().as_ptr() as usize, bytes));
+            Ok(())
+        });
+
+        let mut dev = EfiNetworkDevice::new(NetworkProtocol::Shared(snp), 1, installed.entry());
+        let buf0 = dev.tx_frames[0].buf.as_ptr() as usize;
+        let buf1 = dev.tx_frames[1].buf.as_ptr() as usize;
+
+        // Packet 1 succeeds on the first call without creating a `Timeout`.
+        dev.transmit(Instant::ZERO).unwrap().consume(4, |b| b.copy_from_slice(&[0x11; 4]));
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+
+        // Packet 2 hits `NotReady` twice, arms a single `Timeout`, reclaims `buf0` during retry
+        // polling, and transmits `buf1` on the third attempt with its payload intact.
+        let timeout_ctx = Timeout::new_context();
+        timeout_ctx.expect().times(1).return_once(|_, _| {
+            let mut timeout = Timeout::default();
+            timeout.expect_check().times(2).returning(|| Ok(false));
+            Ok(timeout)
+        });
+        let ret = dev.transmit(Instant::ZERO).unwrap().consume(4, |b| {
+            b.copy_from_slice(&[0x22; 4]);
+            7usize
+        });
+        drop(timeout_ctx);
+        assert_eq!(ret, 7);
+        assert_eq!(attempts.load(Ordering::Relaxed), 4);
+        {
+            let tx = transmitted.lock().unwrap();
+            assert_eq!(tx.len(), 2);
+            assert_eq!(tx[0], (buf0, vec![0x11; 4]));
+            assert_eq!(tx[1], (buf1, vec![0x22; 4]));
+        }
+
+        // Packet 3 immediately reuses reclaimed `buf0` while `buf1` stays in flight.
+        dev.transmit(Instant::ZERO).unwrap().consume(4, |b| b.copy_from_slice(&[0x33; 4]));
+        assert_eq!(transmitted.lock().unwrap()[2], (buf0, vec![0x33; 4]));
+        // SAFETY: `buf1` is a live `[u8; ETHERNET_FRAME_BUFFER_SIZE]` owned by `dev` until drop,
+        // and no mutable reference to it exists outside `consume`.
+        let buf1_payload = unsafe { core::slice::from_raw_parts(buf1 as *const u8, 4) };
+        assert_eq!(buf1_payload, &[0x22; 4]);
+    }
+
+    #[test]
+    fn test_tx_token_not_ready_timeout_drops_frame_and_keeps_slot_idle() {
+        use smoltcp::phy::TxToken as _;
+
+        let _timeout_guard = TIMEOUT_MOCK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let installed = MockEfi::new().install();
+        let fake = FakeSnp::new(INITIALIZED);
+        let ready = Arc::new(AtomicBool::new(false));
+        let attempts = Arc::new(AtomicU32::new(0));
+        let transmitted = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+
+        let mut snp = fake.snp();
+        snp.expect_get_status_raw().returning(|_, _| Ok(()));
+        let ready_tx = ready.clone();
+        let attempts_tx = attempts.clone();
+        let transmitted_tx = transmitted.clone();
+        snp.expect_transmit().returning(move |_, buf, _, _, _| {
+            attempts_tx.fetch_add(1, Ordering::Relaxed);
+            if !ready_tx.load(Ordering::Relaxed) {
+                return Err(Error::NotReady);
+            }
+            // SAFETY: `buf` points to a live `[u8]` slice prepared by `TxToken::consume`.
+            transmitted_tx.lock().unwrap().push(unsafe { buf.as_ref() }.to_vec());
+            Ok(())
+        });
+
+        let mut dev = EfiNetworkDevice::new(NetworkProtocol::Shared(snp), 0, installed.entry());
+
+        // `transmit` keeps returning `NotReady` until the retry timer expires on the 3rd check.
+        let timeout_ctx = Timeout::new_context();
+        timeout_ctx.expect().times(1).return_once(|_, _| {
+            let mut timeout = Timeout::default();
+            let mut checks = 0;
+            timeout.expect_check().times(3).returning(move || {
+                checks += 1;
+                Ok(checks >= 3)
+            });
+            Ok(timeout)
+        });
+        let ret = dev.transmit(Instant::ZERO).unwrap().consume(4, |b| {
+            b.copy_from_slice(&[0xaa; 4]);
+            42usize
+        });
+        drop(timeout_ctx);
+        assert_eq!(ret, 42);
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
+        assert_eq!(fake.resets(), 0);
+        assert!(transmitted.lock().unwrap().is_empty(), "timed-out frame must not record transmit");
+
+        // Once the NIC TX ring drains, the single slot is still idle and immediately reusable.
+        ready.store(true, Ordering::Relaxed);
+        dev.transmit(Instant::ZERO).unwrap().consume(4, |b| b.copy_from_slice(&[0xbb; 4]));
+        assert_eq!(transmitted.lock().unwrap().as_slice(), &[vec![0xbb; 4]]);
+    }
+
+    #[test]
+    fn test_tx_token_not_ready_stops_immediately_on_non_retryable_error() {
+        use smoltcp::phy::TxToken as _;
+
+        let _timeout_guard = TIMEOUT_MOCK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let installed = MockEfi::new().install();
+        let attempts = Arc::new(AtomicU32::new(0));
+        let mut snp = FakeSnp::new(INITIALIZED).snp();
+        snp.expect_get_status_raw().returning(|_, _| Ok(()));
+        let attempts_tx = attempts.clone();
+        snp.expect_transmit().returning(move |_, _, _, _, _| {
+            match attempts_tx.fetch_add(1, Ordering::Relaxed) {
+                0 => Err(Error::NotReady),
+                1 => Err(Error::DeviceError),
+                _ => Ok(()),
+            }
+        });
+
+        let mut dev = EfiNetworkDevice::new(NetworkProtocol::Shared(snp), 0, installed.entry());
+
+        let timeout_ctx = Timeout::new_context();
+        timeout_ctx.expect().times(1).return_once(|_, _| {
+            let mut timeout = Timeout::default();
+            timeout.expect_check().times(1).returning(|| Ok(false));
+            Ok(timeout)
+        });
+        dev.transmit(Instant::ZERO).unwrap().consume(4, |b| b.copy_from_slice(&[0xcc; 4]));
+        drop(timeout_ctx);
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+
+        // Slot remained idle (`!in_flight`), so the next transmit reuses it immediately.
+        dev.transmit(Instant::ZERO).unwrap().consume(4, |b| b.copy_from_slice(&[0xdd; 4]));
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
     }
 }
