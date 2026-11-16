@@ -39,6 +39,7 @@ use efi_types::{
     Identified,
 };
 use liberror::{Error, Result};
+use libgbl::gbl_avb::MAX_PARTITIONS_TO_VERIFY;
 use spin::{Mutex, Spin};
 
 type MutexGuard<'a, T> = spin::MutexGuard<'a, T, Spin>;
@@ -225,15 +226,9 @@ fn partition_buffer_op(
     entry: &EfiEntry,
     op: PartitionBufferOps<'_>,
 ) -> Result<Option<GblVendorReservedMemory>> {
-    // 64 is randomly chosen. Changed if a tighter bound is found.
-    //
-    // TODO(b/578053116): Ideally this should shared the same constant as the maximum avb verify
-    // partitions from libgbl. But doing that currently causes dependency cycle. Alterantively,
-    // investigate letting caller determine the pool size.
-    const POOL_SIZE: usize = 64;
     // The global pool is defined within this function to prevent it from being accidentally
     // accessed by code outside of this function.
-    static PARTITION_BUFFER_POOL: BufferPool<'static, POOL_SIZE> = BufferPool::new();
+    static PARTITION_BUFFER_POOL: BufferPool<'static, MAX_PARTITIONS_TO_VERIFY> = BufferPool::new();
     let protocol = get_protocol(entry)?;
     match op {
         PartitionBufferOps::Get(part) => {
@@ -490,5 +485,19 @@ mod test {
         let pool = BufferPool::<1>::new();
         let _ = pool.get("buf1", true).unwrap();
         assert!(matches!(pool.get("buf2", true), Err(Error::OutOfResources)));
+    }
+
+    #[test]
+    fn test_partition_buffer_pool_limit() {
+        let pool = BufferPool::<MAX_PARTITIONS_TO_VERIFY>::new();
+        for i in 0..MAX_PARTITIONS_TO_VERIFY {
+            let name = format!("part_{i}");
+            drop(pool.get(&name, true).unwrap());
+            assert!(pool.get(&name, false).is_ok(), "missing registered partition {name}");
+        }
+        let overflow = format!("part_{MAX_PARTITIONS_TO_VERIFY}");
+        assert_eq!(pool.get(&overflow, true).err(), Some(Error::OutOfResources));
+        pool.clear_all().unwrap();
+        assert!(pool.get(&overflow, true).is_ok(), "pool should accept entries after clear_all");
     }
 }
