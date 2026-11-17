@@ -336,7 +336,7 @@ config_setting(
 bool_flag(
     name = "pause_boot_in_fastboot",
     build_setting_default = False,
-    help = "Whether to enable always waiting for gdb connection",
+    help = "Whether to always stop in fastboot after loading the OS and before booting",
 )
 
 config_setting(
@@ -575,6 +575,7 @@ toolchain(
 # aarch64 UEFI DEBUG targets
 
 aarch64_uefi_debug_cc_flags = cc_flags_uefi_common + [
+    "-march=armv8-a",
     aarch64_branch_protection,
     "-O0",
 ]
@@ -599,22 +600,27 @@ toolchain(
 )
 
 # riscv64 ELF targets
+
+riscv64_elf_cc_flags = cc_flags_uefi_common + [
+    "-fpie",
+    # Macros required by floating APIs in C++ headers.
+    # This is typically provided by target platform sysroot, which we don't have for our EFI
+    # environment. But since floating point is not used, we simply define placeholder codes.
+    "-DFP_NAN=0",
+    "-DFP_INFINITE=1",
+    "-DFP_ZERO=2",
+    "-DFP_SUBNORMAL=3",
+    "-DFP_NORMAL=4",
+    # The default setting 'all' causes problems on RISC-V
+    "-fstack-protector-strong",
+]
+
+riscv64_elf_cc_flags.remove("-fstack-protector-all")
+
 gbl_clang_cc_toolchain(
     name = "riscv64_elf_clang_cc_toolchain",
     builtin_includes = builtin_includes_uefi_common,
-    cc_flags = cc_flags_uefi_common + [
-        "-fpie",
-        # Macros required by floating APIs in C++ headers.
-        # This is typically provided by target platform sysroot, which we don't have for our EFI
-        # environment. But since floating point is not used, we simply define placeholder codes.
-        "-DFP_NAN=0",
-        "-DFP_INFINITE=1",
-        "-DFP_ZERO=2",
-        "-DFP_SUBNORMAL=3",
-        "-DFP_NORMAL=4",
-        # The default setting 'all' causes problems on RISC-V
-        "-fstack-protector-strong",
-    ],
+    cc_flags = riscv64_elf_cc_flags,
     ld_flags = elf_ld_flags_common,
     target_cpu = "riscv64",
     target_system_triple = "riscv64-unknown-linux",
