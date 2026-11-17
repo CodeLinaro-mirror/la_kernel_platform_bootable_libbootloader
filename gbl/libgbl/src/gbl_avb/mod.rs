@@ -31,7 +31,7 @@ pub mod state;
 const SPECIALIZED_PARTITION_NAME_MAX_SIZE: usize = 36;
 
 /// Maximum number of partitions that libavb and GBL can verify.
-pub(crate) const MAX_PARTITIONS_TO_VERIFY: usize = AVB_MAX_NUMBER_OF_LOADED_PARTITIONS as _;
+pub const MAX_PARTITIONS_TO_VERIFY: usize = AVB_MAX_NUMBER_OF_LOADED_PARTITIONS as _;
 
 /// The maximum number of specialized partitions we can support.
 ///
