@@ -42,7 +42,7 @@ use misc::AndroidBootMode;
 mod avf;
 #[cfg(test)]
 pub(crate) use avf::test::DUMMY_VENDOR_HANDOVER;
-use avf::{avf_fixup_host_dt, avf_update_bootconfig, inject_vmdtbo, BootInfo};
+use avf::{avf_fixup_host_dt, avf_update_bootconfig, BootInfo};
 
 pub(crate) mod hasher;
 
@@ -188,19 +188,6 @@ pub fn android_load_verify_fixup<'a, 'b>(
     let images = android_load_verified(ops, slot, unlocked, is_recovery, &verify_data)?;
 
     let (kernel, kernel_attrs) = kernel_load(images.kernel, kernel)?;
-    let mut pvmfw_buffer = None;
-    let mut pvmfw = None;
-    if !images.pvmfw.is_empty() {
-        let load = pvmfw_buffer.insert(ops.get_boot_buffer(BootBufferType::PvmfwData)?);
-        pvmfw = Some(pvmfw_load(
-            ops,
-            images.pvmfw,
-            load,
-            &kernel_attrs,
-            &BootInfo::new(unlocked, is_recovery, status.color, &verify_data),
-            images.dtbo,
-        )?);
-    }
     let ramdisk_len = ramdisk_load(&images.ramdisks[..], ramdisk)?;
 
     // Updates bootconfig with AVB results and GBL metadata.
@@ -268,7 +255,6 @@ pub fn android_load_verify_fixup<'a, 'b>(
     };
 
     let overlays = selected.as_ref().map_or(&[][..], |v| &v.overlays[..]);
-    let vmdtbo = selected.as_ref().and_then(|v| v.vmdtbo);
 
     // Builds the FDT commandline. Reserves 1024 bytes for separators, kernel command line fixup
     // and FDT fixup.
@@ -281,13 +267,22 @@ pub fn android_load_verify_fixup<'a, 'b>(
         1024,
     )?;
 
-    if let Some((reg, bin_sz)) = pvmfw.as_mut() {
-        let total_size = match vmdtbo {
-            Some(vmdtbo) => inject_vmdtbo(reg, *bin_sz, &kernel_attrs, vmdtbo.dt)?,
-            None => reg.len(),
-        };
-        avf_fixup_host_dt(ops, &mut fdt, &reg[..total_size], *bin_sz, &verify_data)?;
-    };
+    // Builds pvmfw now that device trees are selected, so that its configuration includes the
+    // selected VMDTBO, and describes it in the FDT.
+    let avf_enabled = !images.pvmfw.is_empty();
+    if avf_enabled {
+        let vmdtbo = selected.as_ref().and_then(|v| v.vmdtbo).map_or(&[][..], |v| v.dt);
+        let mut pvmfw_buffer = ops.get_boot_buffer(BootBufferType::PvmfwData)?;
+        let (pvmfw, pvmfw_bin_len) = pvmfw_load(
+            ops,
+            images.pvmfw,
+            &mut pvmfw_buffer,
+            &kernel_attrs,
+            &BootInfo::new(unlocked, is_recovery, status.color, &verify_data),
+            vmdtbo,
+        )?;
+        avf_fixup_host_dt(ops, &mut fdt, pvmfw, pvmfw_bin_len, &verify_data)?;
+    }
 
     let selected_metadata = selected.map(|v| v.into_metadata());
 
@@ -324,7 +319,7 @@ pub fn android_load_verify_fixup<'a, 'b>(
     let bootconfig_sz = finalize_bootconfig(
         ops,
         bootconfig_builder,
-        pvmfw.is_some(),
+        avf_enabled,
         selected_metadata.as_ref(),
         boot_items,
     )?;

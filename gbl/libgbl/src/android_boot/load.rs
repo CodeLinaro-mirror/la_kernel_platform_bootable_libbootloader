@@ -560,7 +560,8 @@ pub(super) fn kernel_load<'b>(
     Ok((&load[..sz], attrs))
 }
 
-/// Loads pvmfw image into `load`.
+/// Loads pvmfw image into `load`, with `vmdtbo` as the VM DTBO configuration entry (empty if none
+/// is selected).
 ///
 /// Returns the pvmfw data region and the size of the pvmfw binary in it.
 pub(super) fn pvmfw_load<'a, 'b>(
@@ -569,13 +570,13 @@ pub(super) fn pvmfw_load<'a, 'b>(
     load: &'b mut [u8],
     kernel_attrs: &KernelAttributes,
     boot_info: &BootInfo<SlotVerifyData>,
-    dtbo_part: &[u8],
-) -> Result<(&'b mut [u8], usize), Error> {
+    vmdtbo: &[u8],
+) -> Result<(&'b [u8], usize), Error> {
     // Parse the partition header and extract the pvmfw binary
     let info = BootImageV3Info::new(img)?;
     let pvmfw_bin = img.get(info.kernel_range.clone()).ok_or(Error::BadBufferSize)?;
-    let sz = build_pvmfw_data_region(ops, load, pvmfw_bin, kernel_attrs, boot_info, dtbo_part)?;
-    Ok((&mut load[..sz], pvmfw_bin.len()))
+    let sz = build_pvmfw_data_region(ops, load, pvmfw_bin, kernel_attrs, boot_info, vmdtbo)?;
+    Ok((&load[..sz], pvmfw_bin.len()))
 }
 
 /// Loads ramdisks into `load`.
