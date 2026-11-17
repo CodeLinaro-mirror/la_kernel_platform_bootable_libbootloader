@@ -29,7 +29,7 @@ def gpt_gen(name, disk_size, partitions, entries_count = 128, **kwargs):
         entries_count: The number of partition entries in the GPT table. Defaults to 128.
         **kwargs: General rule arguments passed to the underlying genrule.
     """
-    cmd = ["$(location //tools/gpt_gen:gpt_gen)"]
+    cmd = ["$(execpath //tools/gpt_gen:gpt_gen)"]
     cmd.append("$@")  # Output file
     cmd.append(disk_size)
 
@@ -40,7 +40,7 @@ def gpt_gen(name, disk_size, partitions, entries_count = 128, **kwargs):
 
         part_str = part_name + "," + size
         if file_label:
-            part_str += ",$(location " + file_label + ")"
+            part_str += ",$(execpath " + file_label + ")"
             srcs.append(file_label)
         else:
             part_str += ","
