@@ -134,6 +134,57 @@ Dynamic memory allocation can be minimized, but not completely eliminated, by
 providing preallocated image buffers via the
 [GBL Boot Memory Protocol](./gbl_efi_boot_memory_protocol.md).
 
+### ResetSystem Runtime Service
+
+- [`EFI_RUNTIME_SERVICES.ResetSystem()`][efi_reset_system]
+- required
+
+Used to reboot the device (e.g. after fastboot `reboot*` commands, active slot
+changes, or fatal errors).
+
+GBL invokes `ResetSystem()` with `ResetType = EfiResetCold`:
+
+| Reboot Reason                          | `ResetStatus`                                                    | `DataSize` | `ResetData`                    |
+| :------------------------------------- | :--------------------------------------------------------------- | :--------- | :----------------------------- |
+| Normal (`reboot`, `set_active`)        | `EFI_SUCCESS`                                                    | `0`        | `NULL`                         |
+| Bootloader (`reboot-bootloader`)       | `EFI_SUCCESS`                                                    | `39`       | `u"bootloader"` + GUID + flags |
+| Userspace Fastboot (`reboot-fastboot`) | `EFI_SUCCESS`                                                    | `35`       | `u"fastboot"` + GUID + flags   |
+| Recovery (`reboot-recovery`)           | `EFI_SUCCESS`                                                    | `35`       | `u"recovery"` + GUID + flags   |
+| Unrecoverable fatal error              | Non-`EFI_SUCCESS` (e.g. `EFI_DEVICE_ERROR`, `EFI_ACCESS_DENIED`) | `0`        | `NULL`                         |
+
+For non-normal reboots, `ResetData` follows the UEFI format of a NUL-terminated
+string followed by binary data, where `N` is the size in bytes of the string
+including its NUL terminator:
+
+| Offset   | Size | Field                                                                                    |
+| :------- | :--- | :--------------------------------------------------------------------------------------- |
+| `0`      | `N`  | NUL-terminated `CHAR16` reason string (`u"bootloader"`, `u"fastboot"`, or `u"recovery"`) |
+| `N`      | `16` | `GBL_EFI_RESET_DATA_GUID` (`b86bef58-5d90-41f1-b721-b3e3b31505fc`)                       |
+| `N + 16` | `1`  | `UINT8` bitmask of `GBL_EFI_RESET_DATA_FLAG_*`                                           |
+
+The GUID is not necessarily 8-byte aligned; copy or compare it bytewise (e.g.
+`memcmp()` or EDK2 `CompareGuid()`) rather than dereferencing it in place.
+Firmware must ignore unknown flag bits.
+
+| Flag                               | Value  | Meaning                                                                                 |
+| :--------------------------------- | :----- | :-------------------------------------------------------------------------------------- |
+| `GBL_EFI_RESET_DATA_FLAG_ONE_SHOT` | `0x01` | GBL failed to persist the reboot target (e.g. `misc` is missing or not provisioned yet) |
+
+Firmware may always use the reason string, e.g. for reset-reason logging or
+`androidboot.bootreason` reporting. GBL determines persistent boot modes using
+the bootloader control block (BCB) in the `misc` partition on Android (and ABR
+metadata on Fuchsia), which GBL updates prior to calling `ResetSystem()`.
+
+Warning: Firmware **must not** set any boot-mode override (sticky or
+cleared-on-read `GBL_EFI_BOOT_CONTROL_PROTOCOL.GetOneShotBootMode()`) from
+`ResetData` unless `GBL_EFI_RESET_DATA_FLAG_ONE_SHOT` is set. Storing the boot
+mode in two places can leave one source unconsumed (for example, Fuchsia
+consumes ABR `one-shot-bootloader` before querying `GetOneShotBootMode()`) and
+cause the device to enter the target mode twice. If the flag is set, firmware
+may carry the reboot target across the reset and report it once via a
+cleared-on-read `GetOneShotBootMode()` on the next boot (e.g. if the device
+needs to reach fastboot or recovery without `misc`, such as on a factory line).
+
 ### RiscvBootProtocol
 
 - [`RISCV_EFI_BOOT_PROTOCOL`][riscv_efi_boot_protocol]
@@ -397,6 +448,8 @@ If this variable is defined, boot as Fuchsia OS.
   https://uefi.org/specs/UEFI/2.11/37_Secure_Technologies.html#efi-hash2-protocol
 [efi_memory_allocation_services]:
   https://uefi.org/specs/UEFI/2.10/07_Services_Boot_Services.html#memory-allocation-services
+[efi_reset_system]:
+  https://uefi.org/specs/UEFI/2.10/08_Services_Runtime_Services.html#resetsystem
 [riscv_efi_boot_protocol]:
   https://github.com/riscv-non-isa/riscv-uefi/blob/main/boot_protocol.adoc
 [efi_simple_network_protocol]:

@@ -26,7 +26,7 @@ use crate::{
     gbl_println,
     metrics::{FirmwareVersionMetrics, GblMetrics, GblTime},
     misc::{read_bootloader_message_to, write_bootloader_message},
-    ops::{BootBufferType, OneShotBootMode, PartitionBuffer},
+    ops::{BootBufferType, OneShotBootMode, PartitionBuffer, RebootMode},
     slots::{slotted_part, Slot},
     GblOps, IntegrationError, Result,
 };
@@ -753,21 +753,29 @@ pub fn android_main<'a, 'b, G: GblOps<'a>>(
     mut boot_buffer: BootBuffer<'b>,
     mut run_fastboot: impl FnMut(GblFastbootEntry<'_, G>),
 ) -> Result<(&'b [u8], &'b [u8], &'b [u8], &'b mut [u8])> {
-    let bcb = read_bootloader_message_to(ops, boot_buffer.scratch()).inspect_err(|e| {
-        gbl_println!(ops, "Failed to read bootloader message from misc partition: {e}")
-    })?;
-    let boot_mode = bcb
-        .boot_mode()
-        .inspect_err(|e| {
-            let cmd = bcb.boot_command();
-            gbl_println!(ops, "Failed to parse BCB boot command {cmd:?}: {e}");
-        })
-        .unwrap_or(AndroidBootMode::Normal);
-
-    if matches!(boot_mode, AndroidBootMode::BootloaderBootOnce) {
-        bcb.update_boot_command(AndroidBootMode::Normal);
-        write_bootloader_message(ops, bcb)?;
-    }
+    let boot_mode = match read_bootloader_message_to(ops, boot_buffer.scratch()) {
+        Ok(bcb) => {
+            let mode = bcb
+                .boot_mode()
+                .inspect_err(|e| {
+                    let cmd = bcb.boot_command();
+                    gbl_println!(ops, "Failed to parse BCB boot command {cmd:?}: {e}");
+                })
+                .unwrap_or(AndroidBootMode::Normal);
+            if matches!(mode, AndroidBootMode::BootloaderBootOnce) {
+                bcb.update_boot_command(AndroidBootMode::Normal);
+                if let Err(e) = write_bootloader_message(ops, bcb) {
+                    gbl_println!(ops, "Failed to clear BCB in misc partition: {e}");
+                }
+            }
+            mode
+        }
+        Err(e) => {
+            gbl_println!(ops, "Failed to read bootloader message from misc partition: {e}");
+            gbl_println!(ops, "Ignoring error and assuming normal boot mode");
+            AndroidBootMode::Normal
+        }
+    };
     gbl_println!(ops, "Boot mode from BCB: {boot_mode:?}");
 
     let one_shot_boot_mode = ops
@@ -779,7 +787,7 @@ pub fn android_main<'a, 'b, G: GblOps<'a>>(
         .unwrap_or(None);
     gbl_println!(ops, "Hardware triggered boot mode override: {one_shot_boot_mode:?}");
 
-    let slot = get_boot_slot(ops)?;
+    let slot_res = get_boot_slot(ops);
 
     let result = &mut Default::default();
     // Checks and enters fastboot.
@@ -803,11 +811,17 @@ pub fn android_main<'a, 'b, G: GblOps<'a>>(
             ops.sync_partition_buffer(true)?;
 
             // Checks whether fastboot has set a different active slot. Reboot if it does.
-            if slot.is_some_and(
-                |s| matches!(result.last_set_active_slot, Some(x) if x != s.suffix.as_char()),
-            ) {
+            //
+            // Skipping this when `slot_res` is `Err` (e.g. slot metadata not yet provisioned) is
+            // not security-relevant: the disk boot path below fails with the same `slot_res`
+            // error, and a "fastboot boot" image still requires an unlocked device. Likewise, a
+            // missing or corrupted `misc` only affects which boot mode is selected; every boot
+            // path still goes through AVB verification and rollback protection.
+            if let Ok(Some(s)) = slot_res
+                && matches!(result.last_set_active_slot, Some(x) if x != s.suffix.as_char())
+            {
                 gbl_println!(ops, "Active slot changed by \"fastboot set_active\". Reset..");
-                ops.reboot()?;
+                ops.reboot(RebootMode::Normal, false)?;
             }
         }
     }
@@ -820,13 +834,15 @@ pub fn android_main<'a, 'b, G: GblOps<'a>>(
         _ => {
             let is_recovery = boot_mode.should_enter_recovery()
                 || matches!(one_shot_boot_mode, Some(OneShotBootMode::Recovery));
-            android_load_verify_fixup(ops, slot, is_recovery, boot_buffer.as_borrowed()).map(
-                |(ramdisk, fdt, kernel)| LoadedImageInfo::Android {
-                    ramdisk: ramdisk.len(),
-                    fdt: fdt.len(),
-                    kernel: kernel.len(),
-                },
-            )
+            slot_res.and_then(|slot| {
+                android_load_verify_fixup(ops, slot, is_recovery, boot_buffer.as_borrowed()).map(
+                    |(ramdisk, fdt, kernel)| LoadedImageInfo::Android {
+                        ramdisk: ramdisk.len(),
+                        fdt: fdt.len(),
+                        kernel: kernel.len(),
+                    },
+                )
+            })
         }
     };
 
@@ -857,7 +873,7 @@ pub fn android_main<'a, 'b, G: GblOps<'a>>(
         });
         if paused_fastboot_continue_should_reboot() {
             gbl_println!(ops, "Device state may have changed. Rebooting...");
-            ops.reboot()?;
+            ops.reboot(RebootMode::Normal, false)?;
         }
     }
 
@@ -2786,6 +2802,88 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_android_main_bootonce_bootloader_clear_error_ignored() {
+        let mut storage = FakeGblOpsStorage::default();
+        storage.add_raw_device(c"boot_a", read_test_data("android/boot_v2_a.img"));
+        storage.add_raw_device(c"vbmeta_a", read_test_data("android/vbmeta_v2_a.img"));
+        let mut misc = vec![0u8; 4 * 1024 * 1024];
+        misc[..b"bootonce-bootloader".len()].copy_from_slice(b"bootonce-bootloader");
+        storage.add_raw_device(c"misc", misc);
+        let mut ops = default_test_gbl_ops(&storage);
+        ops.write_partition_error = Some(Error::WriteProtected);
+
+        test_fastboot_is_triggered(&mut ops);
+    }
+
+    #[test]
+    fn test_android_main_blank_unprovisioned_disk_enters_fastboot() {
+        let storage = FakeGblOpsStorage::default();
+        let mut ops = default_test_gbl_ops(&storage);
+        ops.current_slot = Some(Err(Error::NotFound));
+        ops.slot_count = Some(Err(Error::NotFound));
+        ops.avb_device_status.is_unlocked = true;
+        ops.one_shot_boot_mode = Some(OneShotBootMode::Bootloader);
+
+        let listener: SharedTestListener = Default::default();
+        let mut buffers = TestBootBuffer::new();
+        let res = android_main(&mut ops, buffers.get(), |fb| {
+            listener.add_transport_input(b"getvar:max-fetch-size");
+            listener.add_transport_input(b"set_active:a");
+            listener.add_transport_input(b"continue");
+            // Simulate slot metadata becoming provisioned before `set_active:a` runs; since
+            // `slot_res` before fastboot was `Err`, the `last_set_active_slot` reboot check is
+            // skipped and `continue` fails on the still-unprovisioned boot slot.
+            fb.ops.slot_count = Some(Ok(2));
+            fb.run_n::<2>(&mut vec![0u8; 256 * 1024], &mut [&listener], Some(&listener));
+        });
+
+        assert_eq!(res.unwrap_err(), Error::NotFound.into());
+        assert_eq!(ops.last_reboot_mode, None);
+        assert_eq!(
+            listener.transport_out_queue(),
+            make_expected_transport_out(&[b"OKAY0x20000000", b"OKAY", b"OKAY"]),
+            "\nActual Transport output:\n{}",
+            listener.dump_transport_out_queue()
+        );
+    }
+
+    #[test]
+    fn test_android_main_missing_misc_normal_boot() {
+        let mut storage = FakeGblOpsStorage::default();
+        storage.add_raw_device(c"boot_a", read_test_data("android/boot_v2_a.img"));
+        storage.add_raw_device(c"vbmeta_a", read_test_data("android/vbmeta_v2_a.img"));
+        let mut ops = default_test_gbl_ops(&storage);
+        let mut buffers = TestBootBuffer::new();
+
+        let (ramdisk, _, kernel, _) = android_main(&mut ops, buffers.get(), |_| {}).unwrap();
+        checks_loaded_v2_slot_a_normal_mode(ramdisk, kernel);
+    }
+
+    #[test]
+    fn test_android_main_missing_misc_enter_fastboot_via_one_shot() {
+        let mut storage = FakeGblOpsStorage::default();
+        storage.add_raw_device(c"boot_a", read_test_data("android/boot_v2_a.img"));
+        storage.add_raw_device(c"vbmeta_a", read_test_data("android/vbmeta_v2_a.img"));
+        let mut ops = default_test_gbl_ops(&storage);
+        ops.one_shot_boot_mode = Some(OneShotBootMode::Bootloader);
+
+        test_fastboot_is_triggered(&mut ops);
+    }
+
+    #[test]
+    fn test_android_main_missing_misc_enter_recovery_via_one_shot() {
+        let mut storage = FakeGblOpsStorage::default();
+        storage.add_raw_device(c"boot_a", read_test_data("android/boot_v2_a.img"));
+        storage.add_raw_device(c"vbmeta_a", read_test_data("android/vbmeta_v2_a.img"));
+        let mut ops = default_test_gbl_ops(&storage);
+        ops.one_shot_boot_mode = Some(OneShotBootMode::Recovery);
+        let mut buffers = TestBootBuffer::new();
+
+        let (ramdisk, _, kernel, _) = android_main(&mut ops, buffers.get(), |_| {}).unwrap();
+        checks_loaded_v2_slot_a_recovery_mode(ramdisk, kernel);
+    }
+
+    #[test]
     fn test_android_main_enter_fastboot_via_get_one_shot_boot_mode_recovery_via_bcb() {
         let mut storage = FakeGblOpsStorage::default();
         storage.add_raw_device(c"boot_a", read_test_data("android/boot_v2_a.img"));
@@ -2903,6 +3001,7 @@ pub(crate) mod tests {
             "\nActual Transport output:\n{}",
             listener.dump_transport_out_queue()
         );
+        assert_eq!(ops.last_reboot_mode, Some(RebootMode::Normal));
     }
 
     #[test]
@@ -3170,8 +3269,14 @@ pub(crate) mod tests {
 
         // Only dev builds can continue after stopping post-load, prod builds must reboot.
         match cfg!(feature = "gbl_dev") {
-            true => assert!(res.is_ok()),
-            false => assert_eq!(res.unwrap_err(), Error::Aborted.into()),
+            true => {
+                assert!(res.is_ok());
+                assert_eq!(ops.last_reboot_mode, None);
+            }
+            false => {
+                assert_eq!(res.unwrap_err(), Error::Aborted.into());
+                assert_eq!(ops.last_reboot_mode, Some(RebootMode::Normal));
+            }
         }
 
         assert_eq!(

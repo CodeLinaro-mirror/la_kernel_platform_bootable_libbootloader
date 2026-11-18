@@ -48,7 +48,8 @@ pub use avb::{
     CertPermanentAttributes, IoError as AvbIoError, IoResult as AvbIoResult, SHA256_DIGEST_SIZE,
 };
 pub use fastboot::{
-    CommandExecType, FailSender, InfoSender, LockState, LockType, OkaySender, Unlockability,
+    CommandExecType, FailSender, InfoSender, LockState, LockType, OkaySender, RebootMode,
+    Unlockability,
 };
 pub use gbl_storage::{BlockIo, Disk, Gpt};
 use liberror::Error;
@@ -164,12 +165,21 @@ pub trait GblOps<'a> {
         "\n"
     }
 
-    /// Reboots the system into the last set boot mode.
+    /// Reboots the system.
+    ///
+    /// `mode` is the reboot reason (e.g. for reset logging or `ResetSystem()` `ResetData`).
+    /// Persistent boot-mode selection must be handled previously by the caller (via the `misc`
+    /// BCB on Android or ABR metadata on Fuchsia).
+    ///
+    /// `one_shot` is set if the caller failed to persist the boot mode for `mode`. Implementations
+    /// may then report `mode` once via `get_one_shot_boot_mode()` on the next boot. Otherwise,
+    /// implementations must not set a boot-mode override from `mode`, since storing the boot
+    /// mode in two places can cause the device to enter it twice.
     ///
     /// If successful this method will not return.
     /// If an error is generated instead, the caller is expected to log the error
     /// and bring the system to a halt, usually by entering an infinite loop.
-    fn reboot(&mut self) -> Result<Infallible, Error>;
+    fn reboot(&mut self, mode: RebootMode, one_shot: bool) -> Result<Infallible, Error>;
 
     /// Returns the list of disk devices on this platform.
     ///
@@ -752,8 +762,8 @@ impl<'r, 'a: 'r, T: GblOps<'a>> GblOps<'a> for RambootOps<'r, T> {
         self.ops.console_out()
     }
 
-    fn reboot(&mut self) -> Result<Infallible, Error> {
-        self.ops.reboot()
+    fn reboot(&mut self, mode: RebootMode, one_shot: bool) -> Result<Infallible, Error> {
+        self.ops.reboot(mode, one_shot)
     }
 
     fn disks(
@@ -1308,14 +1318,20 @@ pub(crate) mod test {
         #[cfg(feature = "fuchsia")]
         pub zbi_bootloader_files_buffer: Vec<u8>,
 
-        /// For checking that `Self::reboot` is called.
-        pub rebooted: bool,
+        /// Records the `RebootMode` passed to the most recent `Self::reboot` call.
+        pub last_reboot_mode: Option<RebootMode>,
+
+        /// Records the `one_shot` flag passed to the most recent `Self::reboot` call.
+        pub last_reboot_one_shot: bool,
 
         /// For return by `Self::expected_os()`
         pub os: Option<Os>,
 
         /// For return by `Self::get_random_bytes()`
         pub get_random_bytes_error: Option<Error>,
+
+        /// If set, returned by `Self::write_to_partition_sync()`.
+        pub write_partition_error: Option<Error>,
 
         /// For return by `Self::avb_read_partition_attributes_raw()`
         pub avb_partition_attributes: Option<AvbIoResult<Vec<SpecializedPartition>>>,
@@ -1544,8 +1560,9 @@ pub(crate) mod test {
             Some(self)
         }
 
-        fn reboot(&mut self) -> Result<Infallible, Error> {
-            self.rebooted = true;
+        fn reboot(&mut self, mode: RebootMode, one_shot: bool) -> Result<Infallible, Error> {
+            self.last_reboot_mode = Some(mode);
+            self.last_reboot_one_shot = one_shot;
             Err(Error::Aborted)
         }
 
@@ -1556,6 +1573,18 @@ pub(crate) mod test {
             Gpt<impl DerefMut<Target = [u8]> + 'a>,
         >] {
             self.partitions
+        }
+
+        fn write_to_partition_sync(
+            &mut self,
+            part: &str,
+            off: u64,
+            data: &mut [u8],
+        ) -> Result<(), Error> {
+            if let Some(err) = self.write_partition_error {
+                return Err(err);
+            }
+            write_unique_partition_sync(self.disks(), part, off, data)
         }
 
         fn expected_os(&mut self) -> Result<Option<Os>, Error> {
@@ -2088,7 +2117,7 @@ pub(crate) mod test {
             Some(&mut self.0)
         }
 
-        fn reboot(&mut self) -> Result<Infallible, Error> {
+        fn reboot(&mut self, _mode: RebootMode, _one_shot: bool) -> Result<Infallible, Error> {
             Err(Error::Unsupported)
         }
 
