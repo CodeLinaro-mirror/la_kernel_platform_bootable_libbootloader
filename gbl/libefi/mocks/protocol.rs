@@ -29,7 +29,7 @@ use core::{
     fmt::Write,
     marker::PhantomData,
     ops::Deref,
-    ptr::null_mut,
+    ptr::{null_mut, NonNull},
 };
 pub use efi::protocol::{Revision, Versioned};
 use efi_types::{
@@ -695,12 +695,13 @@ pub mod simple_network {
             ///
             /// # Safety
             ///
-            /// `buf` must be valid until the frame is transmitted or the network interface is
-            /// stopped.
+            /// The caller must ensure that `buf` points to `buf.len()` live, initialized,
+            /// unaliased bytes, and—if `Ok(())` is returned—remains live and unaccessed until
+            /// recycled by `get_status()` or released by `shutdown()`.
             pub unsafe fn transmit(
                 &self,
                 header_size: usize,
-                buf: *mut [u8],
+                buf: NonNull<[u8]>,
                 src: EfiMacAddress,
                 dest: EfiMacAddress,
                 protocol: u16,
