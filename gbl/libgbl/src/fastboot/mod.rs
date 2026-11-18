@@ -6261,7 +6261,7 @@ pub(crate) mod test {
             listener.dump_transport_out_queue()
         );
 
-        assert_eq!(download_trace, vec![vec![], vec![]]);
+        assert_eq!(download_trace, vec![vec![], vec![], vec![]]);
     }
 
     #[test]
@@ -6298,7 +6298,7 @@ pub(crate) mod test {
             listener.dump_transport_out_queue()
         );
 
-        assert_eq!(download_trace, vec![vec![]]);
+        assert_eq!(download_trace, vec![vec![], vec![]]);
     }
 
     // TODO(b/505924108): Add a test that the command exec override can allow commands
@@ -6353,7 +6353,66 @@ pub(crate) mod test {
         expected_download_data_buffer[..download_data.len()].copy_from_slice(download_data);
         assert_eq!(
             download_trace,
-            vec![(expected_download_data_buffer.to_vec(), download_data.len()), (vec![], 0)]
+            vec![
+                (vec![], 0),
+                (expected_download_data_buffer.to_vec(), download_data.len()),
+                (vec![], 0),
+                (vec![], 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_fastboot_command_exec_protected_commands() {
+        let mut storage = FakeGblOpsStorage::default();
+        storage.add_raw_device(c"vendor_boot_a", [0x5au8; KiB!(4)]);
+        storage.add_raw_device(c"frp", [0xeeu8; KiB!(4)]);
+        let buffers = vec![Some(vec![0u8; KiB!(4)]); 1];
+        let mut handler = |cmd: Vec<String>, _download: &mut [u8], _download_used: usize| {
+            let cmd_slices: Vec<&str> = cmd.iter().map(String::as_str).collect();
+            match cmd_slices.as_slice() {
+                ["fetch", part, _, _]
+                    if ["super", "vendor_boot", "vendor_boot_a", "vendor_boot_b"]
+                        .contains(part) =>
+                {
+                    Ok(CommandExecType::DefaultImpl)
+                }
+                ["fetch", "override_attempt", _, _] => Ok(CommandExecType::CustomImpl),
+                ["fetch", ..] => Ok(CommandExecType::Prohibited),
+                _ => Ok(CommandExecType::DefaultImpl),
+            }
+        };
+        let mut gbl_ops = FakeGblOps::new(&storage);
+        gbl_ops.avb_device_status.is_unlocked = true;
+        gbl_ops.fastboot_command_exec_handler = Some(&mut handler);
+        let listener: SharedTestListener = Default::default();
+        let (transports, tcp) = (&mut [&listener], &listener);
+        listener.add_transport_input(b"fetch:vendor_boot_a:0:10");
+        listener.add_transport_input(b"fetch:frp:0:10");
+        listener.add_transport_input(b"fetch:/0:0:10");
+        listener.add_transport_input(b"fetch:override_attempt:0:10");
+        listener.add_transport_input(b"continue");
+        block_on(run_gbl_fastboot_stack::<2>(
+            &mut gbl_ops,
+            buffers,
+            transports,
+            Some(tcp),
+            Default::default(),
+        ));
+        assert_eq!(
+            listener.transport_out_queue(),
+            make_expected_transport_out(&[
+                b"INFOUploading 16 bytes...",
+                b"DATA00000010",
+                &[0x5au8; 0x10],
+                b"OKAY",
+                b"FAILCommand not allowed.",
+                b"FAILCommand not allowed.",
+                b"FAILInternal error: firmware attempted to override a protected command",
+                b"OKAY",
+            ]),
+            "\nActual Transport output:\n{}",
+            listener.dump_transport_out_queue()
         );
     }
 
